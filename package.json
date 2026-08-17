@@ -59,10 +59,10 @@
     "clsx": "2.1.1",
     "cmdk": "^1.1.1",
     "codemirror": "^6.0.2",
-    "discord.js": "^14.26.4",
+    "discord.js": "^14.27.0",
     "dotenv": "^16.4.7",
     "drizzle-orm": "0.45.2",
-    "js-yaml": "^4.1.0",
+    "js-yaml": "^4.3.1",
     "jsonwebtoken": "^9.0.2",
     "lucide-react": "^1.25.0",
     "octokit": "^4.0.2",
@@ -82,7 +82,7 @@
     "@axe-core/playwright": "4.10.2",
     "@playwright/test": "1.61.1",
     "@tailwindcss/vite": "4.3.3",
-    "@testcontainers/postgresql": "^11.14.0",
+    "@testcontainers/postgresql": "^12.1.0",
     "@types/chai": "5.0.1",
     "@types/js-yaml": "^4.0.9",
     "@types/jsonwebtoken": "^9.0.9",
@@ -102,7 +102,7 @@
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
     "vite": "7.3.6",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.10"
   },
   "overrides": {
     "@types/chai": "5.0.1"
