@@ -1,4 +1,6 @@
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
+import type { LinearApiClient, LinearIssueComment } from "../../providers/linear/client.js";
+import { reportFailure } from "../../failures/index.js";
 import type { TriggerProvider, TriggerProviderMatch } from "../index.js";
 import { matchesInputFilters, parseInvocation } from "../invocation.js";
 import { NormalizedLinearEventSchema, type NormalizedLinearEvent } from "./events.js";
@@ -37,12 +39,26 @@ export interface LinearTriggerContext {
   };
 }
 
+export interface LinearIssueThreadContext {
+  status: "materialized" | "unavailable";
+  comments: {
+    id: string;
+    body: string;
+    created_at: string;
+    author: { id: string; name?: string } | null;
+  }[];
+  complete: boolean;
+}
+
 export interface LinearMaterializedContext {
-  linear: LinearTriggerContext["event"]["linear"];
+  linear: LinearTriggerContext["event"]["linear"] & {
+    issue_thread: LinearIssueThreadContext;
+  };
 }
 
 export function createLinearTriggerProvider(options: {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
+  api?: LinearApiClient | undefined;
 }): TriggerProvider<
   "linear",
   LinearTriggerContext,
@@ -123,8 +139,45 @@ export function createLinearTriggerProvider(options: {
       }
       return matches.length === 0 ? "trigger_filters_rejected" : matches;
     },
-    async materializeContext(launch) {
-      return { linear: launch.triggerContext.event.linear };
+    async materializeContext(launch): Promise<LinearMaterializedContext> {
+      const linear = launch.triggerContext.event.linear;
+      // Without history every mention on an issue starts cold: the agent sees neither the
+      // previous request nor its own answer. Slack and Discord hydrate at this same seam.
+      if (options.api === undefined) {
+        return { linear: { ...linear, issue_thread: unavailableIssueThread() } };
+      }
+      let history;
+      try {
+        history = await options.api.readIssueComments({
+          linearOrganizationId: linear.organization.id,
+          issueId: linear.issue.id,
+          ...(linear.comment === null ? {} : { beforeCommentId: linear.comment.id }),
+        });
+      } catch (error) {
+        // An unreadable thread must not fail the run: the agent proceeds with the issue alone,
+        // and the status says so explicitly rather than lying by omission.
+        reportFailure(
+          error,
+          { operation: "linear.thread.hydrate", component: "triggers", provider: "linear" },
+          { diagnostic: { issueId: linear.issue.id } },
+        );
+        return { linear: { ...linear, issue_thread: unavailableIssueThread() } };
+      }
+      return {
+        linear: {
+          ...linear,
+          issue_thread: {
+            status: "materialized",
+            comments: history.comments.map((comment: LinearIssueComment) => ({
+              id: comment.id,
+              body: comment.body,
+              created_at: comment.createdAt,
+              author: comment.author,
+            })),
+            complete: history.complete,
+          },
+        },
+      };
     },
   };
 }
@@ -171,4 +224,8 @@ function buildLinearContext(
     },
     comment: event.type === "comment" ? { id: event.comment.id, body: event.comment.body } : null,
   };
+}
+
+function unavailableIssueThread(): LinearIssueThreadContext {
+  return { status: "unavailable", comments: [], complete: false };
 }

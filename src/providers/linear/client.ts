@@ -56,6 +56,35 @@ const IssueResponseSchema = z.object({
   }),
 });
 
+const LINEAR_ISSUE_COMMENT_LIMIT = 50;
+
+const IssueCommentsResponseSchema = z.object({
+  data: z.object({
+    issue: z
+      .object({
+        comments: z.object({
+          nodes: z.array(
+            z.object({
+              id: z.string().min(1),
+              body: z.string(),
+              createdAt: z.string(),
+              user: z
+                .object({ id: z.string().min(1), name: z.string().optional() })
+                .nullable()
+                .optional(),
+              botActor: z
+                .object({ id: z.string().min(1), name: z.string().optional() })
+                .nullable()
+                .optional(),
+            }),
+          ),
+          pageInfo: z.object({ hasNextPage: z.boolean() }),
+        }),
+      })
+      .nullable(),
+  }),
+});
+
 const CommentResponseSchema = z.object({
   data: z.object({
     commentCreate: z.object({ success: z.literal(true) }),
@@ -98,6 +127,18 @@ export interface LinearIssueDetails {
   labelIds: string[];
 }
 
+export interface LinearIssueComment {
+  id: string;
+  body: string;
+  createdAt: string;
+  author: { id: string; name?: string } | null;
+}
+
+export interface LinearIssueCommentsResult {
+  comments: LinearIssueComment[];
+  complete: boolean;
+}
+
 export interface LinearApiClient {
   readIssue(input: {
     linearOrganizationId: string;
@@ -108,6 +149,11 @@ export interface LinearApiClient {
     issueId: string;
     body: string;
   }): Promise<void>;
+  readIssueComments(input: {
+    linearOrganizationId: string;
+    issueId: string;
+    beforeCommentId?: string;
+  }): Promise<LinearIssueCommentsResult>;
 }
 
 export function hasRequiredLinearScopes(scopes: readonly string[]): boolean {
@@ -278,6 +324,48 @@ export function createLinearApiClient(options: {
             labelIds: issue.labels.nodes.map(({ id }) => id),
           };
     },
+    async readIssueComments(input) {
+      const result = IssueCommentsResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `query PaseoIssueComments($id: String!, $last: Int!) {
+            issue(id: $id) {
+              comments(last: $last) {
+                nodes {
+                  id body createdAt
+                  user { id name }
+                  botActor { id name }
+                }
+                pageInfo { hasNextPage }
+              }
+            }
+          }`,
+          variables: { id: input.issueId, last: LINEAR_ISSUE_COMMENT_LIMIT },
+        }),
+      );
+      const issue = result.data.issue;
+      if (issue === null) return { comments: [], complete: true };
+      // `botActor` carries the author when a comment comes from an application. Without it the
+      // agent's own replies come back unattributed and it cannot recognize its previous turn.
+      const all = issue.comments.nodes.map((node) => {
+        const actor = node.user ?? node.botActor ?? null;
+        return {
+          id: node.id,
+          body: node.body,
+          createdAt: node.createdAt,
+          author:
+            actor === null
+              ? null
+              : { id: actor.id, ...(actor.name === undefined ? {} : { name: actor.name }) },
+        };
+      });
+      // The triggering comment is dropped: it already reaches the agent as the prompt, and
+      // repeating it would read as if the user wrote twice.
+      const comments =
+        input.beforeCommentId === undefined
+          ? all
+          : all.filter((comment) => comment.id !== input.beforeCommentId);
+      return { comments, complete: !issue.comments.pageInfo.hasNextPage };
+    },
     async createComment(input) {
       const result = CommentResponseSchema.parse(
         await graphql(request, await accessTokenFor(input.linearOrganizationId), {
@@ -337,7 +425,7 @@ async function readViewer(request: typeof fetch, accessToken: string) {
 async function graphql(
   request: typeof fetch,
   accessToken: string,
-  payload: { query: string; variables: Record<string, string> },
+  payload: { query: string; variables: Record<string, string | number> },
 ): Promise<unknown> {
   const response = await request("https://api.linear.app/graphql", {
     method: "POST",

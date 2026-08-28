@@ -159,7 +159,7 @@ export function createLinearRegistration(
     connection,
     triggerProviders: [
       ({ configurationStoreForProject }) =>
-        createLinearTriggerProvider({ configurationStoreForProject }),
+        createLinearTriggerProvider({ configurationStoreForProject, api }),
     ],
     sources: [webhook],
     outputs:
