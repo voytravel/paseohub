@@ -95,6 +95,7 @@ export function matchesIssueScope(
 ): boolean {
   if (filter === undefined) return false;
   if (filter.connectionId !== undefined && filter.connectionId !== connectionId) return false;
+  if (filter.team !== undefined && filter.team !== issue.teamId) return false;
   if (filter.project !== undefined && filter.project !== issue.projectId) return false;
   if (filter.states !== undefined && !matchesOptionalId(filter.states, issue.stateId)) return false;
   if (filter.assignees !== undefined && !matchesOptionalId(filter.assignees, issue.assigneeId)) {

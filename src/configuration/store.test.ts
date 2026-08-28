@@ -145,7 +145,7 @@ describe("ProjectConfigurationStore resource compilation", () => {
     );
   });
 
-  it("routes a project-scoped autonomous Linear scout through one Linear connection", async () => {
+  it("routes a team-scoped autonomous Linear scout through one Linear connection", async () => {
     const database = createMemoryDatabase();
     await enrollTestDaemon(database);
     database.organizationConnectionUsage = () =>
@@ -172,6 +172,7 @@ describe("ProjectConfigurationStore resource compilation", () => {
               max_runtime: "1h",
               filters: {
                 connection: "acme-linear",
+                team: "linear-team-1",
                 project: "linear-project-1",
                 states: ["ready"],
               },
@@ -193,11 +194,13 @@ describe("ProjectConfigurationStore resource compilation", () => {
     });
     const active = await store.activate(revision.id);
     assert.equal(active.configuration.triggers[0]?.filters?.connectionId, linear.id);
-    assert.equal(active.configuration.triggers[0]?.filters?.resourceId, "linear-project-1");
+    // La cle de route est l equipe : le projet reste un filtre, mais toute issue Linear a une
+    // equipe alors que la plupart n ont pas de projet, donc lui seul peut router.
+    assert.equal(active.configuration.triggers[0]?.filters?.resourceId, "linear-team-1");
 
     const accepted = await database.acceptLinearEvent({
       linearOrganizationId: linear.linearOrganizationId,
-      projectId: "linear-project-1",
+      projectId: "linear-team-1",
       deliveryId: "linear-scout-entry",
       source: "linear.issue",
       payload: {},

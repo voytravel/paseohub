@@ -49,6 +49,10 @@ const IssueResponseSchema = z.object({
         title: z.string(),
         description: z.string().nullable().optional(),
         url: z.string().url().optional(),
+        team: z
+          .object({ id: z.string().min(1) })
+          .nullable()
+          .optional(),
         project: z
           .object({ id: z.string().min(1) })
           .nullable()
@@ -169,6 +173,7 @@ export interface LinearIssueDetails {
   title: string;
   description: string | null;
   url?: string;
+  teamId: string | null;
   projectId: string | null;
   stateId: string | null;
   assigneeId: string | null;
@@ -412,6 +417,7 @@ export function createLinearApiClient(options: {
           query: `query PaseoIssue($id: String!) {
             issue(id: $id) {
               id identifier title description url
+              team { id }
               project { id }
               state { id }
               assignee { id }
@@ -430,6 +436,7 @@ export function createLinearApiClient(options: {
             title: issue.title,
             description: issue.description ?? null,
             ...(issue.url === undefined ? {} : { url: issue.url }),
+            teamId: issue.team?.id ?? null,
             projectId: issue.project?.id ?? null,
             stateId: issue.state?.id ?? null,
             assigneeId: issue.assignee?.id ?? null,

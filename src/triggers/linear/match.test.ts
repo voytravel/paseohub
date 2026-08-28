@@ -65,6 +65,34 @@ describe("Linear trigger matching", () => {
     );
   });
 
+  it("scopes a trigger to one Linear team", () => {
+    const config = teamScopedConfiguration();
+    assert.deepEqual(
+      matchLinearTriggers(config, commentEvent()).map((match) => match.trigger.name),
+      ["team-scoped"],
+    );
+
+    // Une issue d une autre equipe du meme workspace ne doit rien declencher : la connexion
+    // Linear est partagee par tout le workspace, l equipe est donc la seule frontiere.
+    const other = commentEvent();
+    assert.equal(
+      matchLinearTriggers(config, {
+        ...other,
+        issue: { ...other.issue!, teamId: "team-2" },
+      }).length,
+      0,
+    );
+
+    // Sans equipe non plus : mieux vaut ne rien faire que travailler dans le mauvais depot.
+    assert.equal(
+      matchLinearTriggers(config, {
+        ...other,
+        issue: { ...other.issue!, teamId: null },
+      }).length,
+      0,
+    );
+  });
+
   it("keeps triggers isolated to their configured Linear connection", () => {
     const connectionId = "11111111-1111-4111-8111-111111111111";
     const config = configuration();
@@ -181,6 +209,30 @@ describe("Linear comment invocation parser handoff", () => {
   });
 });
 
+function teamScopedConfiguration() {
+  return compileHubConfig({
+    environments: [{ name: "runner", kind: "daemon", daemon: "runner", cwd: "/repo" }],
+    triggers: [
+      {
+        name: "team-scoped",
+        on: "linear.comment_created",
+        max_runtime: "2h",
+        filters: { team: "team-1", from_users: ["operator"] },
+        steps: [
+          {
+            id: "work",
+            environment: "runner",
+            max_runtime: "1h",
+            idle_timeout: "5m",
+            agent: { provider: "codex" },
+            prompt: [{ text: "Work from ${{ paseo.context }}" }],
+          },
+        ],
+      },
+    ],
+  });
+}
+
 function configuration() {
   const base = {
     id: "work",
@@ -249,6 +301,7 @@ function issue(
     issue: {
       id: "issue-1",
       identifier: "ENG-42",
+      teamId: "team-1",
       title: "Ship the feature",
       description: "Useful context",
       projectId: "project-1",

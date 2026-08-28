@@ -89,6 +89,13 @@ const AuthoredTriggerFilterSchema = z
     repo: z.string().min(1).optional(),
     guild: z.string().min(1).optional(),
     workspace: z.string().min(1).optional(),
+    /**
+     * A Linear team UUID. Teams are the scope key Linear workspaces actually organise around:
+     * every issue has one, unlike `project`. Declaring it also narrows the trigger route, so two
+     * Hub projects can serve different teams of one workspace — the Linear equivalent of
+     * `repo` for GitHub and `channels` for Slack.
+     */
+    team: z.string().min(1).optional(),
     /** A Linear project UUID. It is deliberately a string so imported Linear IDs work verbatim. */
     project: z.string().min(1).optional(),
     /** Linear workflow-state IDs which are eligible for this trigger. */
