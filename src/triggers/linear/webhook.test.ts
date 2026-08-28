@@ -42,11 +42,11 @@ describe("Linear webhook", () => {
     assert.equal(accepted.length, 1);
     assert.deepEqual(
       dispatched.map(({ source: eventSource, resourceId }) => ({ eventSource, resourceId })),
-      [{ eventSource: "linear.issue", resourceId: "project-1" }],
+      [{ eventSource: "linear.issue", resourceId: "team-1" }],
     );
     assert.deepEqual(accepted[0], {
       linearOrganizationId: "linear-org",
-      projectId: "project-1",
+      projectId: "team-1",
       deliveryId: "delivery-1",
       signatureHash: acceptedSignatureHash(),
       source: "linear.issue",
@@ -62,6 +62,7 @@ describe("Linear webhook", () => {
           title: "Ship the feature",
           description: "Useful context",
           url: "https://linear.app/acme/issue/ENG-42/ship-the-feature",
+          teamId: "team-1",
           projectId: "project-1",
           stateId: "ready",
           assigneeId: "user-2",
@@ -104,7 +105,7 @@ describe("Linear webhook", () => {
     );
   });
 
-  it("hydrates a comment issue before project-scoped routing", async () => {
+  it("hydrates a comment issue before team-scoped routing", async () => {
     const accepted: Array<
       Parameters<Parameters<typeof createLinearWebhookSource>[0]["accept"]>[0]
     > = [];
@@ -117,6 +118,7 @@ describe("Linear webhook", () => {
         identifier: "ENG-42",
         title: "Ship the feature",
         description: null,
+        teamId: "team-1",
         projectId: "project-1",
         stateId: "ready",
         assigneeId: null,
@@ -129,7 +131,7 @@ describe("Linear webhook", () => {
     });
 
     assert.equal((await endpoint.handle(request(commentEnvelope(), "Comment"))).status, 200);
-    assert.equal(accepted[0]?.projectId, "project-1");
+    assert.equal(accepted[0]?.projectId, "team-1");
     assert.equal(accepted[0]?.source, "linear.comment");
   });
 
@@ -147,6 +149,7 @@ describe("Linear webhook", () => {
         identifier: "ENG-42",
         title: "Ship the feature",
         description: "Useful context",
+        teamId: "team-1",
         projectId: "project-1",
         stateId: "ready",
         assigneeId: "app-user",
@@ -166,7 +169,7 @@ describe("Linear webhook", () => {
 
     assert.equal(response.status, 200);
     assert.equal(accepted[0]?.source, "linear.agent_session");
-    assert.equal(accepted[0]?.projectId, "project-1");
+    assert.equal(accepted[0]?.projectId, "team-1");
     assert.equal(dispatched[0]?.source, "linear.agent_session");
     assert.equal(
       NormalizedLinearAgentSessionEventSchema.parse(accepted[0]?.payload).prompt,
@@ -337,6 +340,7 @@ function issueEnvelope() {
       title: "Ship the feature",
       description: "Useful context",
       url: "https://linear.app/acme/issue/ENG-42/ship-the-feature",
+      teamId: "team-1",
       projectId: "project-1",
       stateId: "ready",
       assigneeId: "user-2",

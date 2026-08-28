@@ -5,7 +5,7 @@ import { logger } from "../../logger.js";
 import { logProviderEventIntake } from "../audit.js";
 import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
-import { eventIssueId, eventProjectId, normalizeLinearEvent } from "./events.js";
+import { eventIssueId, eventProjectId, eventTeamId, normalizeLinearEvent } from "./events.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
@@ -153,10 +153,14 @@ async function acceptAndDispatchLinearEvent(
   options: LinearWebhookSourceOptions,
   preserveBindingDrop = false,
 ): Promise<Response> {
-  const projectId = eventProjectId(event);
+  // La cle de routage est l equipe, pas le projet : toute issue Linear a une equipe, alors que
+  // la plupart n ont pas de projet. Router sur le projet laissait donc les workspaces
+  // multi-equipes sans aucun moyen de distinguer leurs evenements. Les declencheurs cadres par
+  // projet continuent de filtrer a l appariement, ou `filters.project` est toujours evalue.
+  const scopeId = eventTeamId(event) ?? eventProjectId(event);
   const acceptance = await options.accept({
     linearOrganizationId: event.organizationId,
-    ...(projectId === undefined ? {} : { projectId }),
+    ...(scopeId === undefined ? {} : { projectId: scopeId }),
     deliveryId: verified.deliveryId,
     signatureHash: verified.signatureHash,
     source,
@@ -170,7 +174,7 @@ async function acceptAndDispatchLinearEvent(
     provider: "linear",
     source,
     deliveryId: verified.deliveryId,
-    resourceId: projectId,
+    resourceId: scopeId,
     acceptance,
   });
   const events = acceptance.status === "accepted" ? acceptance.events : [];

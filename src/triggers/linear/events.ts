@@ -9,6 +9,7 @@ const LinearIssueSchema = z.object({
   title: z.string(),
   description: z.string().nullable(),
   url: z.string().url().optional(),
+  teamId: LinearIdSchema.nullable(),
   projectId: LinearIdSchema.nullable(),
   stateId: LinearIdSchema.nullable(),
   assigneeId: LinearIdSchema.nullable(),
@@ -109,6 +110,15 @@ export function normalizeLinearEvent(
 export function eventIssueId(event: NormalizedLinearEvent): string {
   if (event.type === "issue") return event.issue.id;
   return event.type === "comment" ? event.comment.issueId : event.agentSession.issueId;
+}
+
+/**
+ * Every Linear issue belongs to a team; most belong to no project. The team is therefore the
+ * only scope key that is always present, which is what routing needs.
+ */
+export function eventTeamId(event: NormalizedLinearEvent): string | undefined {
+  const issue = event.type === "issue" ? event.issue : event.issue;
+  return issue === null ? undefined : (issue.teamId ?? undefined);
 }
 
 export function eventProjectId(event: NormalizedLinearEvent): string | undefined {
@@ -369,6 +379,7 @@ function normalizeIssue(
     title,
     description: nullableValue(data, "description", hydrated?.description ?? null),
     ...optionalProperty("url", url),
+    teamId: relatedId(data, "teamId", "team", hydrated?.teamId ?? null),
     projectId: relatedId(data, "projectId", "project", hydrated?.projectId ?? null),
     stateId: relatedId(data, "stateId", "state", hydrated?.stateId ?? null),
     assigneeId: relatedId(data, "assigneeId", "assignee", hydrated?.assigneeId ?? null),

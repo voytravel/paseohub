@@ -656,7 +656,7 @@ function readAuthoredResource(
   if (provider === "github") value = filters.repo;
   else if (provider === "slack") value = filters.workspace;
   else if (provider === "discord") value = filters.guild;
-  else value = filters.project;
+  else value = filters.team;
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
@@ -714,10 +714,16 @@ function triggerFilterPath(trigger: CompiledTrigger, field: string): readonly (s
   return [trigger.sourceFile ?? ".paseo/workflows", "filters", field];
 }
 
-function resourceField(provider: ConnectionProvider): "repo" | "workspace" | "guild" | "project" {
+/**
+ * The filter field that narrows a trigger route to one resource. Linear scopes on the team
+ * rather than the project: every issue has a team, most have no project, so the project could
+ * never serve as a route key for a multi-team workspace. `filters.project` remains available
+ * and is still evaluated when matching.
+ */
+function resourceField(provider: ConnectionProvider): "repo" | "workspace" | "guild" | "team" {
   if (provider === "github") return "repo";
   if (provider === "slack") return "workspace";
-  return provider === "discord" ? "guild" : "project";
+  return provider === "discord" ? "guild" : "team";
 }
 
 function providerLabel(provider: ConnectionProvider): string {
