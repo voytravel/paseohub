@@ -974,7 +974,8 @@ describe("daemon enrollment and execution", () => {
     await hub.restartApp();
     await dispatch;
 
-    const recovered = await hub.waitForRecoveredExecution(pending.id);
+    await hub.waitForRecoveredExecution(pending.id);
+    const recovered = await hub.waitForExecutionStatus(pending.id, "running");
     assert.deepEqual(
       {
         status: recovered.status,
