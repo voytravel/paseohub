@@ -538,75 +538,72 @@ export function createLinearTriggerProvider(
       // panel the user keeps writing into, and Linear treats it as one conversation.
       return triggerContext.event.linear.agent_session !== null;
     },
-    async onDispatchAccepted(triggerContext, _outputContext, reactionState) {
-      const agentSession = triggerContext.event.linear.agent_session;
-      if (agentSession === null || options.client === undefined) return reactionState;
+    async onDispatchAccepted(triggerContext, outputContext, reactionState) {
+      const agentSessionId = triggerContext.event.linear.agent_session?.id ?? outputContext.agentSessionId ?? null;
+      if (agentSessionId === null || options.client === undefined) return reactionState;
       if (linearAgentReactionPhase(reactionState) !== undefined) return reactionState;
       // A fresh budget per turn: the ceiling protects one turn from flooding the issue, it is not
       // a lifetime quota on the conversation.
-      resetMirror(agentSession.id, triggerContext.target.turnKey);
+      resetMirror(agentSessionId, triggerContext.target.turnKey);
       await options.client.createAgentActivity({
         linearOrganizationId: triggerContext.event.linear.organization.id,
-        agentSessionId: agentSession.id,
+        agentSessionId: agentSessionId,
         content: {
           type: "thought",
-          body: "Paseo accepted this task and is starting the workflow.",
+          body: "Paseo a pris en charge la tâche et démarre l'exécution.",
         },
-        ephemeral: true,
+        ephemeral: false,
       });
       return { phase: "accepted" };
     },
-    async onAgentExecutionCompleted(triggerContext, _outputContext, result, reactionState) {
-      const agentSession = triggerContext.event.linear.agent_session;
-      if (agentSession === null || options.client === undefined) return reactionState;
+    async onAgentExecutionCompleted(triggerContext, outputContext, result, reactionState) {
+      const agentSessionId = triggerContext.event.linear.agent_session?.id ?? outputContext.agentSessionId ?? null;
+      if (agentSessionId === null || options.client === undefined) return reactionState;
       if (linearAgentReactionPhase(reactionState) === "completed") return reactionState;
       // Linear keeps the session `active` (then `stale`) until a response or error
       // lands. A reply already closed it; otherwise close it explicitly. Unknown
       // emissions are left alone rather than risking a false "no reply" notice.
       if (
-        _outputContext.publishIssueComment !== true &&
+        outputContext.publishIssueComment !== true &&
         result.outputEmissions !== undefined &&
         (result.outputEmissions[LINEAR_REPLY_OUTPUT_TYPE] ?? 0) === 0
       ) {
         await options.client.createAgentActivity({
           linearOrganizationId: triggerContext.event.linear.organization.id,
-          agentSessionId: agentSession.id,
+          agentSessionId: agentSessionId,
           content: {
             type: "response",
-            body: "Paseo finished this workflow without posting a reply.",
+            body: "Paseo a terminé son exécution.",
           },
         });
       }
       return { phase: "completed" };
     },
-    async onAgentExecutionFailed(triggerContext, _outputContext, reason, reactionState) {
-      return notifyLinearAgentFailure(options.client, triggerContext, reason, reactionState);
+    async onAgentExecutionFailed(triggerContext, outputContext, reason, reactionState) {
+      return notifyLinearAgentFailure(options.client, triggerContext, reason, reactionState, outputContext);
     },
     async onMachineTerminated(triggerContext, reason, reactionState) {
-      return notifyLinearAgentFailure(options.client, triggerContext, reason, reactionState);
+      return notifyLinearAgentFailure(options.client, triggerContext, reason, reactionState, triggerContext.target);
     },
     /**
      * Mirrors the running agent into the session panel.
-     *
-     * Only sessions have a panel to mirror into: a comment-triggered run answers with a single
-     * comment, and posting its every step would turn one reply into fifty.
      */
     async onAgentStreamEvent(triggerContext, outputContext, event, executionId) {
-      const agentSession = triggerContext.event.linear.agent_session;
-      if (agentSession === null) return;
+      const agentSessionId = triggerContext.event.linear.agent_session?.id ?? outputContext.agentSessionId ?? null;
+      if (agentSessionId === null) return;
       await mirrorActivities(triggerContext, outputContext, event, executionId);
     },
     async onAgentExecutionTerminal(executionId, triggerContext) {
       if (triggerContext.target.publishIssueComment === true) {
         await options.reportMissingTerminalOutcome?.(executionId);
       }
-      const agentSession = triggerContext.event.linear.agent_session;
-      if (agentSession === null) return;
+      const agentSessionId = triggerContext.event.linear.agent_session?.id ?? triggerContext.target.agentSessionId ?? null;
+      if (agentSessionId === null) return;
       // Drains before dropping: the last activities of a turn are the ones that explain how it
       // ended, and losing them to a cleanup would be the wrong trade.
-      await mirrorQueues.get(agentSession.id);
-      mirrors.delete(agentSession.id);
-      mirrorQueues.delete(agentSession.id);
+      await mirrorQueues.get(agentSessionId);
+      mirrors.delete(agentSessionId);
+      mirrorQueues.delete(agentSessionId);
     },
   };
 }
@@ -908,7 +905,7 @@ function linearFilterRejectionReason(
     )
   )
     return "linear_issue_outside_scope";
-  if (appUserId === undefined || event.issue.delegateId !== appUserId)
+  if (event.type !== "agent_session" && (appUserId === undefined || event.issue.delegateId !== appUserId))
     return "linear_issue_not_delegated";
   if (
     event.actor !== null &&
@@ -1905,9 +1902,14 @@ async function notifyLinearAgentFailure(
   triggerContext: LinearTriggerContext,
   reason: string,
   reactionState: TriggerProviderReactionState | undefined,
+  outputContext?: LinearOutputContext,
 ): Promise<TriggerProviderReactionState | undefined> {
-  const agentSession = triggerContext.event.linear.agent_session;
-  if (agentSession === null || client === undefined) return reactionState;
+  const agentSessionId =
+    triggerContext.event.linear.agent_session?.id ??
+    outputContext?.agentSessionId ??
+    triggerContext.target.agentSessionId ??
+    null;
+  if (agentSessionId === null || client === undefined) return reactionState;
   if (linearAgentReactionPhase(reactionState) === "failed") return reactionState;
   // The stop handler already confirmed the stop; an error would contradict it. A conversation
   // whose turn restarted elsewhere is not a failure the user should read about either.
@@ -1916,7 +1918,7 @@ async function notifyLinearAgentFailure(
   }
   await client.createAgentActivity({
     linearOrganizationId: triggerContext.event.linear.organization.id,
-    agentSessionId: agentSession.id,
+    agentSessionId: agentSessionId,
     content: { type: "error", body: linearFailureBody(reason) },
   });
   return { phase: "failed" };

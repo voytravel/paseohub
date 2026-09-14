@@ -206,6 +206,7 @@ function matchesRequiredDelegate(
   issue: NormalizedLinearIssue,
   appUserId: string | null | undefined,
 ): boolean {
+  if (event.type === "agent_session") return true;
   if (trigger.on !== "linear.delegated_issue_updated" && trigger.filters?.require_delegate !== true)
     return true;
   return appUserId != null && issue.delegateId === appUserId && event.actor?.id !== appUserId;
@@ -221,7 +222,6 @@ function matchesDelegatedComment(
     typeof appUserId !== "string" ||
     event.actor === null ||
     event.actor.id === appUserId ||
-    issue.delegateId !== appUserId ||
     (event.comment.parentId !== null && event.threadIsAgentSession !== false)
   )
     return false;
@@ -229,6 +229,7 @@ function matchesDelegatedComment(
   const body = event.comment.body.toLowerCase();
   const mentionsThisApp = body.includes("@pagent") || body.includes("@p agent") || body.includes(appUserId.toLowerCase());
   if (!mentionsThisApp) {
+    if (issue.delegateId !== appUserId) return false;
     const hasOtherMention = /@[a-z0-9_-]+/i.test(event.comment.body) || /\[@[^\]]+\]\([^)]+\)/i.test(event.comment.body) || /<user id="[^"]+"/i.test(event.comment.body);
     if (hasOtherMention) return false;
   }
