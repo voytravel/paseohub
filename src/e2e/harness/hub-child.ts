@@ -106,7 +106,7 @@ async function main(): Promise<void> {
       serverId: "hub-e2e-seed-server",
       daemonPublicKey: "hub-e2e-seed-public-key",
       credentialVerifier: "hub-e2e-seed-credential-verifier",
-      scopes: ["hub.execution.*"],
+      permissions: ["hub.execute"],
       now: new Date(),
     });
     daemon = enrollment?.status === "slug_conflict" ? undefined : enrollment;
@@ -186,7 +186,6 @@ async function main(): Promise<void> {
               hubConfig: compiledConfiguration,
               invocation: {
                 status: "accepted",
-                rawMessage: "Deploy mcp-capability for phase-five-operator",
                 prompt: "Deploy mcp-capability for phase-five-operator",
                 inputs: {},
               },

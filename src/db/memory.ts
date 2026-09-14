@@ -1,7 +1,60 @@
+import {
+  linearTriageIntakeKey,
+  type LinearTriageIntakeRecord,
+  type LinearTriageIntakeClaim,
+  type LinearTriageIntakeKey,
+  type LinearTriageIntakeSettlement,
+} from "./linear-triage-intakes.js";
+import {
+  linearIssueSessionBridgeKey,
+  type LinearIssueSessionBridgeClaim,
+  type LinearIssueSessionBridgeKey,
+  type LinearIssueSessionBridgeScope,
+  type LinearIssueSessionBridgeRecord,
+} from "./linear-issue-session-bridges.js";
+import {
+  assertWorkspacePlacement,
+  workspacePlacementKey,
+  type WorkspacePlacementClaim,
+  type WorkspacePlacementRecord,
+} from "./workspace-placements.js";
+import { linearDispatchKey } from "./linear-dispatch.js";
+import { matchingLinearReplyConnection } from "../triggers/linear/reply-authority.js";
+import type { ReserveLinearFinalization, LinearIssueFinalization } from "./linear-finalizations.js";
+import { nextTurnOutputContext } from "./turn-output-context.js";
+import {
+  acknowledgeLinearReplyExecution,
+  newLinearReply,
+  terminalLinearReplyAttempt,
+  linearReplyTurnKey,
+  type LinearReplyDelivery,
+  type ReserveLinearReply,
+} from "./linear-replies.js";
+import type { LinearWebhookInboxRecord } from "./types.js";
+import { linearCommentBridgeKey } from "./linear-comment-bridges.js";
+import type {
+  LinearCommentBridgeClaim,
+  LinearCommentBridgeKey,
+  LinearCommentBridgeRecord,
+} from "./types.js";
 import { randomUUID } from "node:crypto";
 import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
-import type { JsonValue } from "../config/compiler.js";
+import { completesAtIdleDeadline, matchesIdleTurnCompletionCondition } from "./idle-completion.js";
+import {
+  linearIssueExecutionKey,
+  executionStillOwnsWork,
+  ISSUE_EXECUTION_RETRY_MS,
+} from "./linear-issue-serialization.js";
+import {
+  currentTurnOutputEmissions,
+  isCurrentTurnAttempt,
+} from "../execution-capabilities/required-outputs.js";
+import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import {
+  hasRequiredLinearAgentSessionScopes,
+  linearConnectionRequiresReauthorization,
+} from "../providers/linear/client.js";
 import type {
   AgentExecutionRecord,
   AgentExecutionOutputAttempt,
@@ -25,7 +78,9 @@ import type {
   AdvanceGitHubConnectionAttemptInput,
   BindDiscordConnectionInput,
   BindGitHubConnectionInput,
+  BindLinearConnectionInput,
   BindSlackConnectionInput,
+  CompleteLinearProviderApplicationInput,
   CompleteSlackProviderApplicationInput,
   ConnectionStartAuthority,
   ConnectionProvider,
@@ -37,6 +92,7 @@ import type {
   ConfigurationSyncAttemptRecord,
   AcceptDiscordEventInput,
   AcceptGitHubEventInput,
+  AcceptLinearEventInput,
   AcceptSlackEventInput,
   DurableProviderEvent,
   GitHubLifecycleReceiptClaim,
@@ -56,9 +112,16 @@ import type {
   GitHubConfigurationTarget,
   DiscordConnectionRecord,
   SlackConnectionRecord,
+  LinearConnectionRecord,
   GitHubRepositoryRecord,
   OrganizationConnectionUsage,
   ProjectTriggerRoute,
+  MigrateProjectTriggersInput,
+  OrganizationTriggerRecord,
+  OrganizationTriggerRevisionRecord,
+  PendingProjectTriggerMigration,
+  SaveOrganizationTriggerInput,
+  OrganizationTriggerRoute,
   CreateAcceptedTriggerRunInput,
   CreateRejectedTriggerRunInput,
   AcceptedTriggerRunRecord,
@@ -81,8 +144,10 @@ import type {
   ConsumeOrganizationUsageInput,
   BillingPlanRecord,
   SyncBillingPlanInput,
-  OrganizationSubscriptionRecord,
-  ReconcileOrganizationSubscriptionInput,
+  OrganizationBillingCustomerRecord,
+  ReconcileOrganizationBillingInput,
+  UpdateLinearConnectionTokensInput,
+  LinearConnectionRefreshOperation,
 } from "./types.js";
 import {
   clearOverrideKey,
@@ -91,7 +156,7 @@ import {
 } from "../entitlements/catalog.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
-  isProviderEventDropReasonCode,
+  isUnroutedProviderEventDropReasonCode,
   type ProviderEventDropReasonCode,
 } from "../triggers/drop-reason.js";
 
@@ -109,6 +174,7 @@ export interface MemoryDatabaseOptions {
     role: "owner" | "admin" | "member";
   }[];
   now?: () => Date;
+  slackConnections?: readonly SlackConnectionRecord[];
 }
 
 function usageKey(organizationId: string, meter: string, periodStart: Date): string {
@@ -139,11 +205,461 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 }
 
 class MemoryDatabase implements Database {
+  private readonly workspacePlacements = new Map<string, WorkspacePlacementRecord>();
+
+  async claimWorkspacePlacement(input: WorkspacePlacementClaim): Promise<WorkspacePlacementRecord> {
+    const key = workspacePlacementKey(input);
+    let record = this.workspacePlacements.get(key);
+    if (record === undefined) {
+      record = { ...input, createdAt: this.now() };
+      this.workspacePlacements.set(key, record);
+    }
+    assertWorkspacePlacement(record, input);
+    return structuredClone(record);
+  }
+  private readonly linearWebhookInbox = new Map<string, LinearWebhookInboxRecord>();
+
+  async admitLinearWebhook(input: Parameters<Database["admitLinearWebhook"]>[0]) {
+    const prior = [...this.linearWebhookInbox.values()].find(
+      (row) =>
+        row.applicationId === input.applicationId &&
+        (row.deliveryId === input.deliveryId || row.signatureHash === input.signatureHash),
+    );
+    if (prior !== undefined) return prior;
+    const row: LinearWebhookInboxRecord = {
+      ...input,
+      id: randomUUID(),
+      nextAttemptAt: this.now(),
+      attempts: 0,
+      completedAt: null,
+      lastError: null,
+    };
+    this.linearWebhookInbox.set(row.id, row);
+    return row;
+  }
+  async listPendingLinearWebhooks(applicationId: string, now: Date, limit: number) {
+    return [...this.linearWebhookInbox.values()]
+      .filter(
+        (row) =>
+          row.applicationId === applicationId &&
+          row.completedAt === null &&
+          row.nextAttemptAt <= now,
+      )
+      .sort((a, b) => a.receivedAt.getTime() - b.receivedAt.getTime())
+      .slice(0, limit);
+  }
+  async findLinearWebhook(id: string) {
+    return this.linearWebhookInbox.get(id);
+  }
+  async settleLinearWebhook(id: string, outcome: Parameters<Database["settleLinearWebhook"]>[1]) {
+    const row = this.linearWebhookInbox.get(id);
+    if (row === undefined) throw new Error("verified Linear webhook not found");
+    this.linearWebhookInbox.set(id, {
+      ...row,
+      attempts: row.attempts + 1,
+      ...("completedAt" in outcome
+        ? { completedAt: outcome.completedAt, lastError: null }
+        : { nextAttemptAt: outcome.retryAt, lastError: outcome.error.slice(0, 2000) }),
+    });
+  }
+  private readonly linearTriageIntakes = new Map<string, LinearTriageIntakeRecord>();
+  async findLinearTriageIntake(key: LinearTriageIntakeKey) {
+    const record = this.linearTriageIntakes.get(linearTriageIntakeKey(key));
+    return record === undefined ? undefined : structuredClone(record);
+  }
+  async claimLinearTriageIntake(input: LinearTriageIntakeClaim) {
+    const key = linearTriageIntakeKey(input);
+    let record = this.linearTriageIntakes.get(key);
+    if (record === undefined) {
+      const { now: _now, ...source } = input;
+      record = {
+        ...structuredClone(source),
+        status: "reserved",
+        reason: null,
+        attemptStartedAt: null,
+      };
+    } else if (
+      !["applied", "ignored"].includes(record.status) &&
+      record.leaseExpiresAt <= input.now
+    ) {
+      record = { ...record, leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+    }
+    this.linearTriageIntakes.set(key, record);
+    return {
+      record: structuredClone(record),
+      claimed: !["applied", "ignored"].includes(record.status) && record.leaseId === input.leaseId,
+    };
+  }
+  async startLinearTriageIntake(key: LinearTriageIntakeKey, leaseId: string, now: Date) {
+    const id = linearTriageIntakeKey(key);
+    const record = this.linearTriageIntakes.get(id);
+    if (
+      record === undefined ||
+      record.leaseId !== leaseId ||
+      record.leaseExpiresAt <= now ||
+      record.status !== "reserved" ||
+      record.attemptStartedAt !== null
+    )
+      return false;
+    this.linearTriageIntakes.set(id, { ...record, status: "attempted", attemptStartedAt: now });
+    return true;
+  }
+  async settleLinearTriageIntake(
+    key: LinearTriageIntakeKey,
+    leaseId: string,
+    outcome: LinearTriageIntakeSettlement,
+  ) {
+    const id = linearTriageIntakeKey(key);
+    const record = this.linearTriageIntakes.get(id);
+    if (record === undefined) throw new Error("Linear intake reservation is missing");
+    if (
+      !["applied", "ignored"].includes(record.status) &&
+      (record.leaseId === leaseId ||
+        (outcome.status === "applied" && record.attemptStartedAt !== null))
+    ) {
+      this.linearTriageIntakes.set(id, { ...record, ...outcome });
+    }
+    return structuredClone(this.linearTriageIntakes.get(id)!);
+  }
+
+  private readonly linearIssueSessionBridges = new Map<string, LinearIssueSessionBridgeRecord>();
+
+  async claimLinearIssueSessionBridge(input: LinearIssueSessionBridgeClaim) {
+    const key = linearIssueSessionBridgeKey(input);
+    let bridge = this.linearIssueSessionBridges.get(key);
+    if (bridge === undefined) {
+      const { now: _now, ...initial } = input;
+      bridge = { ...initial, sessionId: null, creationStartedAt: null };
+    } else if (bridge.sessionId === null && bridge.leaseExpiresAt <= input.now) {
+      bridge = { ...bridge, leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+    }
+    this.linearIssueSessionBridges.set(key, bridge);
+    return {
+      bridge: structuredClone(bridge),
+      claimed: bridge.sessionId === null && bridge.leaseId === input.leaseId,
+    };
+  }
+
+  async findLinearIssueSessionBridge(key: LinearIssueSessionBridgeKey) {
+    const bridge = this.linearIssueSessionBridges.get(linearIssueSessionBridgeKey(key));
+    return bridge === undefined ? undefined : structuredClone(bridge);
+  }
+
+  async bindLinearIssueSessionBridge(key: LinearIssueSessionBridgeKey, sessionId: string) {
+    const id = linearIssueSessionBridgeKey(key);
+    const bridge = this.linearIssueSessionBridges.get(id);
+    if (bridge === undefined) throw new Error("Linear issue session reservation is missing");
+    if (bridge.sessionId !== null && bridge.sessionId !== sessionId)
+      throw new Error("Linear issue event has conflicting native session identities");
+    const bound = { ...bridge, sessionId };
+    this.linearIssueSessionBridges.set(id, bound);
+    return structuredClone(bound);
+  }
+  async startLinearIssueSessionBridgeCreation(
+    key: LinearIssueSessionBridgeKey,
+    leaseId: string,
+    now: Date,
+  ) {
+    const id = linearIssueSessionBridgeKey(key);
+    const bridge = this.linearIssueSessionBridges.get(id);
+    if (
+      bridge === undefined ||
+      bridge.leaseId !== leaseId ||
+      bridge.leaseExpiresAt <= now ||
+      bridge.sessionId !== null ||
+      bridge.creationStartedAt !== null
+    )
+      return false;
+    this.linearIssueSessionBridges.set(id, { ...bridge, creationStartedAt: now });
+    return true;
+  }
+  async findLinearIssueSessionBridgeBySession(
+    scope: LinearIssueSessionBridgeScope,
+    sessionId: string,
+  ) {
+    return this.findLinearIssueSessionBridgeByIdentity(scope, "sessionId", sessionId);
+  }
+  async findLinearIssueSessionBridgeByMarker(
+    scope: LinearIssueSessionBridgeScope,
+    markerUrl: string,
+  ) {
+    return this.findLinearIssueSessionBridgeByIdentity(scope, "markerUrl", markerUrl);
+  }
+  private findLinearIssueSessionBridgeByIdentity(
+    scope: LinearIssueSessionBridgeScope,
+    field: "sessionId" | "markerUrl",
+    value: string,
+  ) {
+    const matches = [...this.linearIssueSessionBridges.values()].filter(
+      (bridge) =>
+        bridge.organizationId === scope.organizationId &&
+        bridge.projectId === scope.projectId &&
+        bridge.connectionId === scope.connectionId &&
+        bridge.linearOrganizationId === scope.linearOrganizationId &&
+        bridge.issueId === scope.issueId &&
+        bridge.appUserId === scope.appUserId &&
+        bridge[field] === value,
+    );
+    if (matches.length > 1) throw new Error("Linear issue session has multiple reservations");
+    return matches[0] === undefined ? undefined : structuredClone(matches[0]);
+  }
+  private readonly linearCommentBridges = new Map<string, LinearCommentBridgeRecord>();
+
+  async claimLinearCommentBridge(input: LinearCommentBridgeClaim) {
+    const key = linearCommentBridgeKey(input);
+    let bridge = this.linearCommentBridges.get(key);
+    if (bridge === undefined) {
+      const { now: _now, ...initial } = input;
+      bridge = { ...initial, sessionId: null, creationStartedAt: null };
+    } else if (bridge.sessionId === null && bridge.leaseExpiresAt <= input.now) {
+      bridge = { ...bridge, leaseId: input.leaseId, leaseExpiresAt: input.leaseExpiresAt };
+    }
+    this.linearCommentBridges.set(key, bridge);
+    return {
+      bridge: structuredClone(bridge),
+      claimed: bridge.sessionId === null && bridge.leaseId === input.leaseId,
+    };
+  }
+
+  async findLinearCommentBridge(key: LinearCommentBridgeKey) {
+    const bridge = this.linearCommentBridges.get(linearCommentBridgeKey(key));
+    return bridge === undefined ? undefined : structuredClone(bridge);
+  }
+
+  async bindLinearCommentBridge(key: LinearCommentBridgeKey, sessionId: string) {
+    const id = linearCommentBridgeKey(key);
+    const bridge = this.linearCommentBridges.get(id);
+    if (bridge === undefined) throw new Error("Linear bridge reservation is missing");
+    const bound = { ...bridge, sessionId: bridge.sessionId ?? sessionId };
+    this.linearCommentBridges.set(id, bound);
+    return structuredClone(bound);
+  }
+  async startLinearCommentBridgeCreation(key: LinearCommentBridgeKey, leaseId: string, now: Date) {
+    const id = linearCommentBridgeKey(key);
+    const bridge = this.linearCommentBridges.get(id);
+    if (
+      bridge === undefined ||
+      bridge.leaseId !== leaseId ||
+      bridge.leaseExpiresAt <= now ||
+      bridge.sessionId !== null ||
+      bridge.creationStartedAt !== null
+    )
+      return false;
+    this.linearCommentBridges.set(id, { ...bridge, creationStartedAt: now });
+    return true;
+  }
   private readonly providerEventReceipts = new Map<string, ProviderEventReceiptRecord>();
   private readonly providerEventReceiptIdsByDelivery = new Map<string, string>();
   private readonly providerEventReceiptIdsBySignature = new Map<string, string>();
   private readonly machines = new Map<string, MachineRecord>();
   private readonly agentExecutions = new Map<string, AgentExecutionRecord>();
+  private readonly linearReplies = new Map<string, LinearReplyDelivery>();
+  private readonly linearFinalizations = new Map<string, LinearIssueFinalization>();
+  async reserveLinearFinalization(
+    input: ReserveLinearFinalization,
+  ): Promise<LinearIssueFinalization> {
+    const existing = this.linearFinalizations.get(input.replyId);
+    if (existing !== undefined) return structuredClone(existing);
+    const record: LinearIssueFinalization = {
+      ...input,
+      status: "pending",
+      startedAt: null,
+      completedAt: null,
+      detail: null,
+    };
+    this.linearFinalizations.set(input.replyId, record);
+    return structuredClone(record);
+  }
+  async findLinearFinalization(replyId: string): Promise<LinearIssueFinalization | undefined> {
+    const record = this.linearFinalizations.get(replyId);
+    return record === undefined ? undefined : structuredClone(record);
+  }
+  async startLinearFinalization(replyId: string, now: Date): Promise<boolean> {
+    const record = this.linearFinalizations.get(replyId);
+    if (record === undefined || record.status !== "pending" || record.startedAt !== null)
+      return false;
+    this.linearFinalizations.set(replyId, { ...record, startedAt: now });
+    return true;
+  }
+  async completeLinearFinalization(
+    replyId: string,
+    status: Exclude<LinearIssueFinalization["status"], "pending">,
+    detail: string,
+    now: Date,
+  ): Promise<void> {
+    const record = this.linearFinalizations.get(replyId);
+    if (record?.status === "pending")
+      this.linearFinalizations.set(replyId, { ...record, status, detail, completedAt: now });
+  }
+  async beginTerminalLinearReplyAttempt(
+    executionId: string,
+    expectedTurnKey: string,
+    now: Date,
+  ): Promise<AgentExecutionOutputAttempt | undefined> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution === undefined) return undefined;
+    const attempt = terminalLinearReplyAttempt(execution, expectedTurnKey, now);
+    if (attempt === undefined) return undefined;
+    this.agentExecutions.set(executionId, {
+      ...execution,
+      outputDeliveryAttempts: { ...execution.outputDeliveryAttempts, [attempt.id]: attempt },
+    });
+    return structuredClone(attempt);
+  }
+  async listTerminalLinearReplyCandidates(applicationId: string, limit: number): Promise<string[]> {
+    const found: string[] = [];
+    for (const execution of this.agentExecutions.values()) {
+      const context = execution.outputContext;
+      if (
+        typeof context !== "object" ||
+        context === null ||
+        Reflect.get(context, "publishIssueComment") !== true ||
+        Reflect.get(context, "provider") !== "linear" ||
+        (execution.status !== "failed" && execution.status !== "succeeded")
+      )
+        continue;
+      const linearOrganizationId: unknown = Reflect.get(context, "linearOrganizationId");
+      const issueId: unknown = Reflect.get(context, "issueId");
+      if (typeof linearOrganizationId !== "string" || typeof issueId !== "string") continue;
+      const connection = await this.findLinearConnectionForOrganization(
+        execution.organizationId,
+        linearOrganizationId,
+      );
+      if (
+        connection?.providerApplicationId !== applicationId ||
+        connection.id !==
+          matchingLinearReplyConnection(execution.triggerContext, {
+            linearOrganizationId,
+            issueId,
+          }) ||
+        (await this.findLinearReply(
+          execution.id,
+          linearReplyTurnKey(execution.hubActionAcknowledgements.turn?.id),
+        )) !== undefined
+      )
+        continue;
+      found.push(execution.id);
+      if (found.length === limit) break;
+    }
+    return found;
+  }
+  async reserveLinearReply(input: ReserveLinearReply): Promise<LinearReplyDelivery> {
+    const prior = [...this.linearReplies.values()].find(
+      (entry) => entry.executionId === input.executionId && entry.turnKey === input.turnKey,
+    );
+    if (prior !== undefined) return structuredClone(prior);
+    const record = newLinearReply(input);
+    this.linearReplies.set(record.id, record);
+    return structuredClone(record);
+  }
+  async findLinearReply(
+    executionId: string,
+    turnKey: string,
+  ): Promise<LinearReplyDelivery | undefined> {
+    const record = [...this.linearReplies.values()].find(
+      (entry) => entry.executionId === executionId && entry.turnKey === turnKey,
+    );
+    return record === undefined ? undefined : structuredClone(record);
+  }
+  async listPendingLinearReplies(
+    applicationId: string,
+    now: Date,
+    limit: number,
+  ): Promise<LinearReplyDelivery[]> {
+    return [...this.linearReplies.values()]
+      .filter(
+        (entry) =>
+          entry.payload.applicationId === applicationId &&
+          entry.completedAt === null &&
+          entry.supersededAt === null &&
+          !["refused", "ambiguous"].includes(
+            this.linearFinalizations.get(entry.id)?.status ?? "",
+          ) &&
+          entry.nextAttemptAt <= now &&
+          (entry.leaseExpiresAt === null || entry.leaseExpiresAt <= now),
+      )
+      .sort((a, b) => a.nextAttemptAt.getTime() - b.nextAttemptAt.getTime())
+      .slice(0, limit)
+      .map((entry) => structuredClone(entry));
+  }
+  async claimLinearReply(
+    id: string,
+    leaseId: string,
+    now: Date,
+    leaseExpiresAt: Date,
+  ): Promise<LinearReplyDelivery | undefined> {
+    const record = this.linearReplies.get(id);
+    if (
+      record === undefined ||
+      record.completedAt !== null ||
+      record.supersededAt !== null ||
+      (record.leaseExpiresAt !== null && record.leaseExpiresAt > now)
+    )
+      return undefined;
+    const claimed = { ...record, leaseId, leaseExpiresAt, attempts: record.attempts + 1 };
+    this.linearReplies.set(id, claimed);
+    return structuredClone(claimed);
+  }
+  async confirmLinearReplyDestination(
+    id: string,
+    destination: "comment" | "activity",
+    now: Date,
+  ): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (record !== undefined)
+      this.linearReplies.set(id, {
+        ...record,
+        ...(destination === "comment"
+          ? { commentConfirmedAt: record.commentConfirmedAt ?? now }
+          : { activityConfirmedAt: record.activityConfirmedAt ?? now }),
+      });
+  }
+  async retryLinearReply(
+    id: string,
+    leaseId: string,
+    nextAttemptAt: Date,
+    error: string,
+  ): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (
+      record !== undefined &&
+      record.leaseId === leaseId &&
+      record.completedAt === null &&
+      record.supersededAt === null
+    )
+      this.linearReplies.set(id, {
+        ...record,
+        nextAttemptAt,
+        lastError: error,
+        leaseId: null,
+        leaseExpiresAt: null,
+      });
+  }
+  async supersedeLinearReply(id: string, now: Date): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (record !== undefined && record.completedAt === null && record.commentConfirmedAt !== null)
+      this.linearReplies.set(id, {
+        ...record,
+        supersededAt: now,
+        lastError: "Native response superseded by a newer turn",
+        leaseId: null,
+        leaseExpiresAt: null,
+      });
+  }
+  async acknowledgeLinearReply(id: string, now: Date): Promise<void> {
+    const record = this.linearReplies.get(id);
+    if (record === undefined) throw new Error("Linear reply journal is missing");
+    const execution = this.agentExecutions.get(record.executionId);
+    if (execution === undefined) throw new Error("Linear reply execution is missing");
+    this.agentExecutions.set(execution.id, acknowledgeLinearReplyExecution(record, execution, now));
+    this.linearReplies.set(id, {
+      ...record,
+      completedAt: record.completedAt ?? now,
+      lastError: null,
+      leaseId: null,
+      leaseExpiresAt: null,
+    });
+  }
   private readonly triggerRuns = new Map<string, TriggerRunRecord>();
   private readonly triggerRunIdsByProviderEventReceipt = new Map<
     string,
@@ -160,7 +676,10 @@ class MemoryDatabase implements Database {
   private readonly entitlementChanges: EntitlementChangeRecord[] = [];
   private readonly organizationUsage = new Map<string, OrganizationUsageRecord>();
   private readonly billingPlans = new Map<string, BillingPlanRecord>();
-  private readonly organizationSubscriptions = new Map<string, OrganizationSubscriptionRecord>();
+  private readonly organizationBillingCustomers = new Map<
+    string,
+    OrganizationBillingCustomerRecord
+  >();
   private readonly advisoryLocks = new Map<string, Promise<void>>();
   private readonly projects = new Map<string, ProjectRecord>();
   private readonly configurationRevisions = new Map<string, ProjectConfigurationRevisionRecord>();
@@ -177,14 +696,25 @@ class MemoryDatabase implements Database {
   >();
   private readonly configurationSyncAttempts = new Map<string, ConfigurationSyncAttemptRecord[]>();
   private readonly projectTriggerRoutes = new Map<string, ProjectTriggerRoute[]>();
+  private readonly organizationTriggers = new Map<string, OrganizationTriggerRecord>();
+  private readonly organizationTriggerRevisions = new Map<
+    string,
+    OrganizationTriggerRevisionRecord
+  >();
+  private readonly migratedProjects = new Set<string>();
+  private readonly organizationTriggerRoutes = new Map<string, OrganizationTriggerRoute[]>();
   private readonly githubRepositories = new Map<string, GitHubRepositoryRecord>();
   private readonly githubConnections = new Map<number, GitHubConnectionRecord>();
   private readonly discordConnections = new Map<string, DiscordConnectionRecord>();
   private readonly slackConnections = new Map<string, SlackConnectionRecord>();
+  private readonly linearConnections = new Map<string, LinearConnectionRecord>();
   private readonly organizationIds: Set<string>;
 
   constructor(private readonly options: MemoryDatabaseOptions = {}) {
     this.organizationIds = new Set(options.organizationIds);
+    for (const connection of options.slackConnections ?? []) {
+      this.slackConnections.set(connection.teamId, connection);
+    }
   }
 
   private now(): Date {
@@ -205,6 +735,18 @@ class MemoryDatabase implements Database {
   async createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
   ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }> {
+    const turnKey = linearDispatchKey(input.outputContext);
+    if (turnKey !== undefined) {
+      const duplicate = [...this.triggerRuns.values()].find(
+        (run) =>
+          run.organizationId === input.organizationId &&
+          run.projectId === input.projectId &&
+          run.outcome === "accepted" &&
+          linearDispatchKey(run.outputContext) === turnKey,
+      );
+      if (duplicate?.outcome === "accepted") return { run: duplicate, created: false };
+    }
+
     const projectRuns =
       this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
       new Map<string, Map<string, string>>();
@@ -227,7 +769,6 @@ class MemoryDatabase implements Database {
       configuredTriggerName: input.configuredTriggerName,
       outcome: "accepted",
       status: "running",
-      rawPrompt: input.rawPrompt,
       prompt: input.prompt,
       inputs: freezeEvidence(input.inputs),
       values: freezeEvidence(input.values ?? {}),
@@ -300,7 +841,6 @@ class MemoryDatabase implements Database {
       configuredTriggerName: input.configuredTriggerName,
       outcome: "rejected",
       status: "rejected",
-      rawPrompt: input.rawPrompt,
       prompt: input.prompt,
       inputs: freezeEvidence(input.inputs),
       values: freezeEvidence(input.values ?? {}),
@@ -348,6 +888,16 @@ class MemoryDatabase implements Database {
           left.configuredTriggerName.localeCompare(right.configuredTriggerName),
       )
       .slice(0, limit);
+  }
+
+  async listTriggerRunsForLinearComments(projectId: string, commentIds: readonly string[]) {
+    const wanted = new Set(commentIds);
+    return (await this.listTriggerRunsForProject(projectId, Number.POSITIVE_INFINITY)).filter(
+      (run) => {
+        const commentId = linearCommentIdOf(run.triggerContext);
+        return commentId !== undefined && wanted.has(commentId);
+      },
+    );
   }
 
   async findWorkflowStepRunById(id: string) {
@@ -406,6 +956,16 @@ class MemoryDatabase implements Database {
   }
 
   async createWorkflowStepExecution(input: WorkflowStepExecutionInput) {
+    const issueKey = linearIssueExecutionKey(
+      input.execution.projectId,
+      input.execution.triggerContext,
+    );
+    return issueKey === undefined
+      ? this.createWorkflowStepExecutionUnderLock(input)
+      : this.withAdvisoryLock(issueKey, () => this.createWorkflowStepExecutionUnderLock(input));
+  }
+
+  private async createWorkflowStepExecutionUnderLock(input: WorkflowStepExecutionInput) {
     let step = (await this.listWorkflowStepRunsForTriggerRun(input.triggerRunId)).find(
       (candidate) => candidate.stepId === input.stepId && candidate.ordinal === input.ordinal,
     );
@@ -431,6 +991,28 @@ class MemoryDatabase implements Database {
         execution: undefined,
         created: false,
       };
+    }
+    const issueKey = linearIssueExecutionKey(
+      input.execution.projectId,
+      input.execution.triggerContext,
+    );
+    if (
+      issueKey !== undefined &&
+      [...this.agentExecutions.values()].some(
+        (execution) =>
+          execution.id !== input.executionId &&
+          executionStillOwnsWork(execution) &&
+          linearIssueExecutionKey(execution.projectId, execution.triggerContext) === issueKey,
+      )
+    ) {
+      const deferredUntil = new Date(startedAt.getTime() + ISSUE_EXECUTION_RETRY_MS);
+      this.workflowWakeups.set(run.id, {
+        triggerRunId: run.id,
+        availableAt: deferredUntil,
+        leaseExpiresAt: null,
+        leasedBeforeClaim: false,
+      });
+      return { stepRun: step, execution: undefined, created: false, deferredUntil };
     }
     // Reserve one meter unit before creating the execution, so a denied reservation creates
     // nothing — the in-memory single-threaded model gives the same atomicity the Postgres
@@ -543,17 +1125,10 @@ class MemoryDatabase implements Database {
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {
     const execution = this.readAgentExecution(input.executionId);
+    if (!matchesIdleTurnCompletionCondition(execution, input.idleTurnCondition))
+      return { execution, transitioned: false };
     if (execution.workflowStepRunId === null) {
-      return this.transitionAgentExecution(execution.id, input.executionStatus, {
-        result: input.result,
-        ...(input.completedByAgent === undefined
-          ? {}
-          : { completedByAgent: input.completedByAgent }),
-        ...(input.deadlineCondition === undefined
-          ? {}
-          : { deadlineCondition: input.deadlineCondition }),
-        ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
-      });
+      return this.transitionWorkflowExecution(input);
     }
     const step = this.workflowStepRuns.get(execution.workflowStepRunId);
     if (step === undefined)
@@ -578,30 +1153,37 @@ class MemoryDatabase implements Database {
         );
       }
       if (deadlineKind !== undefined) {
-        const timedOut = this.timeoutWorkflowStep(execution.id, deadlineKind, observedAt);
-        const terminalRun = this.triggerRuns.get(run.id);
-        return transitionWithTerminalRun(timedOut, terminalRun);
+        const resolved = this.resolveWorkflowStepDeadline(
+          execution,
+          step,
+          run,
+          deadlineKind,
+          observedAt,
+        );
+        return transitionWithTerminalRun(resolved, this.triggerRuns.get(run.id));
       }
     }
 
     const transitioned =
       execution.status === "spawning" || execution.status === "running"
-        ? await this.transitionAgentExecution(execution.id, input.executionStatus, {
-            result: input.result,
-            ...(input.completedByAgent === undefined
-              ? {}
-              : { completedByAgent: input.completedByAgent }),
-            ...(input.deadlineCondition === undefined
-              ? {}
-              : { deadlineCondition: input.deadlineCondition }),
-            ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
-          })
+        ? await this.transitionWorkflowExecution(input)
         : { execution, transitioned: false };
     if (transitioned.transitioned || isTerminalAgentExecutionStatus(execution.status)) {
       this.finishWorkflowStep(step, run, input);
     }
     const terminalRun = this.triggerRuns.get(run.id);
     return transitionWithTerminalRun(transitioned, terminalRun);
+  }
+
+  private transitionWorkflowExecution(input: WorkflowAgentCompletionInput) {
+    return this.transitionAgentExecution(input.executionId, input.executionStatus, {
+      result: input.result,
+      ...(input.completedByAgent === undefined ? {} : { completedByAgent: input.completedByAgent }),
+      ...(input.deadlineCondition === undefined
+        ? {}
+        : { deadlineCondition: input.deadlineCondition }),
+      ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
+    });
   }
 
   private finishWorkflowStep(
@@ -650,6 +1232,52 @@ class MemoryDatabase implements Database {
       });
     }
     this.workflowWakeups.delete(run.id);
+  }
+
+  /** A step whose execution already emitted an output completes at its idle deadline; any other step deadline times it out. */
+  private resolveWorkflowStepDeadline(
+    execution: AgentExecutionRecord,
+    step: WorkflowStepRunRecord,
+    run: TriggerRunRecord,
+    deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">,
+    now: Date,
+  ): TransitionAgentExecutionResult {
+    return deadlineKind === "step_idle" && completesAtIdleDeadline(execution)
+      ? this.completeWorkflowStepAtIdleDeadline(execution, step, run, now)
+      : this.timeoutWorkflowStep(execution.id, deadlineKind, now);
+  }
+
+  private completeWorkflowStepAtIdleDeadline(
+    execution: AgentExecutionRecord,
+    step: WorkflowStepRunRecord,
+    run: TriggerRunRecord,
+    now: Date,
+  ): TransitionAgentExecutionResult {
+    const result = { status: "succeeded" as const };
+    const hubAction: AgentExecutionRecord["hubAction"] =
+      execution.daemonId !== null && execution.launchIntent?.autoArchive === true
+        ? "archive"
+        : null;
+    const updatedExecution: AgentExecutionRecord = {
+      ...execution,
+      status: "succeeded",
+      completedAt: now,
+      result,
+      idleDeadlineAt: null,
+      hubAction,
+      hubActionCompletedAt: hubAction === null ? now : null,
+      hubActionReadyAt: null,
+      hubActionAcknowledgements: emptyHubActionAcknowledgements(),
+    };
+    this.agentExecutions.set(execution.id, updatedExecution);
+    this.finishWorkflowStep(step, run, {
+      executionId: execution.id,
+      executionStatus: "succeeded",
+      stepStatus: "succeeded",
+      result,
+      observedAt: now,
+    });
+    return { execution: updatedExecution, transitioned: true };
   }
 
   private timeoutWorkflowStep(
@@ -792,8 +1420,18 @@ class MemoryDatabase implements Database {
         const deadlineKind = workflowDeadlineKind(execution, step, run, now);
         if (deadlineKind === undefined || deadlineKind === "whole_run") continue;
         if (execution !== undefined) {
-          const recovery = this.timeoutWorkflowStep(execution.id, deadlineKind, now);
-          recoveries.push({ triggerRunId: run.id, executionIds: [recovery.execution.id] });
+          const resolved = this.resolveWorkflowStepDeadline(
+            execution,
+            step,
+            run,
+            deadlineKind,
+            now,
+          );
+          recoveries.push(
+            resolved.execution.status === "succeeded"
+              ? { triggerRunId: run.id, executionIds: [], completedExecutionIds: [execution.id] }
+              : { triggerRunId: run.id, executionIds: [execution.id] },
+          );
         } else {
           this.workflowStepRuns.set(step.id, {
             ...step,
@@ -1024,6 +1662,22 @@ class MemoryDatabase implements Database {
     );
   }
 
+  async acceptLinearEvent(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance> {
+    const binding = await this.findLinearConnection(input.linearOrganizationId);
+    const reason = linearDropReason(input, binding);
+    const resourceIds = [input.projectId, input.teamId].flatMap((id) =>
+      id === undefined ? [] : [id],
+    );
+    return this.acceptMemoryEvent(
+      input,
+      binding?.organizationId,
+      binding?.id,
+      resourceIds[0] ?? null,
+      reason,
+      resourceIds,
+    );
+  }
+
   async persistManualEvent(input: PersistManualEventInput) {
     const existing = this.findReceiptId(
       input.organizationId,
@@ -1176,6 +1830,21 @@ class MemoryDatabase implements Database {
 
   async findProviderEventReceiptById(id: string): Promise<ProviderEventReceiptRecord | undefined> {
     return this.providerEventReceipts.get(id);
+  }
+
+  async listLinearAgentSessionReceiptsForComment(organizationId: string, commentId: string) {
+    return [...this.providerEventReceipts.values()]
+      .filter(
+        (receipt) =>
+          receipt.organizationId === organizationId &&
+          receipt.source === "linear.agent_session" &&
+          receipt.droppedReason === null &&
+          linearAgentSessionCommentIdsOf(receipt.payload).includes(commentId),
+      )
+      .sort(
+        (left, right) =>
+          right.receivedAt.getTime() - left.receivedAt.getTime() || right.id.localeCompare(left.id),
+      );
   }
 
   async insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord> {
@@ -1486,7 +2155,7 @@ class MemoryDatabase implements Database {
       serverId: input.serverId,
       daemonPublicKey: input.daemonPublicKey,
       credentialVerifier: input.credentialVerifier,
-      scopes: input.scopes,
+      permissions: input.permissions,
       registeredByApiKeyId: token.issuedByApiKeyId ?? null,
       registeredByCliCredentialId: token.issuedByCliCredentialId ?? null,
       status: "active",
@@ -1545,6 +2214,13 @@ class MemoryDatabase implements Database {
       connectedAt: presence === "connected" ? new Date() : value.connectedAt,
       disconnectedAt: presence === "offline" ? new Date() : value.disconnectedAt,
     });
+  }
+  async setDaemonPermissions(id: string, permissions: string[]) {
+    const value = this.daemons.get(id);
+    if (!value) return undefined;
+    const updated = { ...value, permissions: [...permissions] };
+    this.daemons.set(id, updated);
+    return updated;
   }
   async revokeDaemon(id: string) {
     const value = this.daemons.get(id);
@@ -1682,24 +2358,28 @@ class MemoryDatabase implements Database {
   async beginAgentExecutionOutput(
     executionId: string,
     outputType: string,
-    maxOutputs: number,
+    maxOutputs: number | undefined,
     startedAt: Date,
   ): Promise<AgentExecutionOutputAttempt | undefined> {
     const execution = this.agentExecutions.get(executionId);
     if (
       execution === undefined ||
-      maxOutputs < 1 ||
+      (maxOutputs !== undefined && maxOutputs < 1) ||
       (execution.status !== "spawning" && execution.status !== "running")
     ) {
       return undefined;
     }
     const activeAttempts = Object.values(execution.outputDeliveryAttempts).filter(
       (attempt) =>
+        isCurrentTurnAttempt(execution, attempt) &&
         attempt.outputType === outputType &&
         attempt.status === "pending" &&
         attempt.leaseExpiresAt > startedAt,
     ).length;
-    if ((execution.outputEmissions[outputType] ?? 0) + activeAttempts >= maxOutputs) {
+    if (
+      maxOutputs !== undefined &&
+      (currentTurnOutputEmissions(execution)[outputType] ?? 0) + activeAttempts >= maxOutputs
+    ) {
       return undefined;
     }
     const attempt: AgentExecutionOutputAttempt = {
@@ -1709,6 +2389,9 @@ class MemoryDatabase implements Database {
       startedAt,
       leaseExpiresAt: new Date(startedAt.getTime() + OUTPUT_ATTEMPT_LEASE_MS),
       completedAt: null,
+      ...(execution.hubActionAcknowledgements.turn === undefined
+        ? {}
+        : { turnId: execution.hubActionAcknowledgements.turn.id }),
     };
     this.agentExecutions.set(executionId, {
       ...execution,
@@ -1718,6 +2401,78 @@ class MemoryDatabase implements Database {
       },
     });
     return attempt;
+  }
+
+  async beginAgentExecutionTurn(
+    executionId: string,
+    startedAt: Date,
+    inputId?: string,
+    context?: { triggerContext: unknown; outputContext: unknown },
+  ): Promise<AgentExecutionRecord | undefined> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution === undefined) return undefined;
+    if (execution.status !== "spawning" && execution.status !== "running") return undefined;
+    const updated: AgentExecutionRecord = {
+      ...execution,
+      ...(context === undefined
+        ? {}
+        : {
+            triggerContext: context.triggerContext,
+            outputContext: nextTurnOutputContext(execution.outputContext, context.outputContext),
+          }),
+      idleDeadlineAt: null,
+      hubActionAcknowledgements: {
+        ...execution.hubActionAcknowledgements,
+        terminalAt: null,
+        idleAt: null,
+        finishExecutionCall: null,
+        turn: { id: randomUUID(), startedAt },
+        ...(inputId === undefined
+          ? {}
+          : {
+              inputDeliveries: {
+                ...execution.hubActionAcknowledgements.inputDeliveries,
+                [inputId]: "pending" as const,
+              },
+            }),
+      },
+    };
+    this.agentExecutions.set(executionId, updated);
+    return updated;
+  }
+
+  async recordAgentExecutionInputDelivery(
+    executionId: string,
+    inputId: string,
+    delivered: boolean,
+  ): Promise<void> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution === undefined) throw new Error("agent execution not found");
+    const inputDeliveries = { ...execution.hubActionAcknowledgements.inputDeliveries };
+    if (delivered) inputDeliveries[inputId] = "delivered";
+    else delete inputDeliveries[inputId];
+    this.agentExecutions.set(executionId, {
+      ...execution,
+      hubActionAcknowledgements: { ...execution.hubActionAcknowledgements, inputDeliveries },
+    });
+  }
+
+  async findAgentExecutionInputDelivery(
+    projectId: string,
+    inputId: string,
+    initialTurnKey?: string,
+  ): Promise<{ executionId: string; status: "pending" | "delivered" } | undefined> {
+    for (const execution of this.agentExecutions.values()) {
+      if (execution.projectId !== projectId) continue;
+      if (
+        initialTurnKey !== undefined &&
+        linearDispatchKey(execution.outputContext) === initialTurnKey
+      )
+        return { executionId: execution.id, status: "delivered" };
+      const status = execution.hubActionAcknowledgements.inputDeliveries?.[inputId];
+      if (status !== undefined) return { executionId: execution.id, status };
+    }
+    return undefined;
   }
 
   async completeAgentExecutionOutput(
@@ -1874,7 +2629,11 @@ class MemoryDatabase implements Database {
     const execution = this.agentExecutions.get(executionId);
     if (execution === undefined) return undefined;
     const current = execution.hubActionAcknowledgements;
+    if (current.turn !== undefined && acknowledgement.observedAt < current.turn.startedAt)
+      return execution;
+    if (!acknowledgementMatchesTurn(acknowledgement, current)) return undefined;
     const updatedAcknowledgements: AgentExecutionHubAcknowledgements = {
+      ...current,
       terminalAt: current.terminalAt,
       idleAt: current.idleAt,
       finishExecutionCall: current.finishExecutionCall,
@@ -2143,20 +2902,15 @@ class MemoryDatabase implements Database {
     return Array.from(this.billingPlans.values());
   }
 
-  async reconcileOrganizationSubscription(
-    input: ReconcileOrganizationSubscriptionInput,
-  ): Promise<OrganizationSubscriptionRecord> {
-    const record: OrganizationSubscriptionRecord = {
+  async reconcileOrganizationBilling(
+    input: ReconcileOrganizationBillingInput,
+  ): Promise<OrganizationBillingCustomerRecord> {
+    const record: OrganizationBillingCustomerRecord = {
       organizationId: input.organizationId,
       stripeCustomerId: input.stripeCustomerId,
-      stripeSubscriptionId: input.stripeSubscriptionId,
-      planId: input.planId,
-      status: input.status,
-      currentPeriodEnd: input.currentPeriodEnd,
-      cancelAtPeriodEnd: input.cancelAtPeriodEnd,
       updatedAt: this.now(),
     };
-    this.organizationSubscriptions.set(input.organizationId, record);
+    this.organizationBillingCustomers.set(input.organizationId, record);
     // No await between the two writes, so on Node's single thread the mirror and the stamp land
     // together — the in-memory stand-in for the Postgres transaction that couples them.
     if (input.stamp !== undefined) {
@@ -2189,16 +2943,317 @@ class MemoryDatabase implements Database {
     }
   }
 
-  async getOrganizationSubscription(
+  async getOrganizationBillingCustomer(
     organizationId: string,
-  ): Promise<OrganizationSubscriptionRecord | undefined> {
-    return this.organizationSubscriptions.get(organizationId);
+  ): Promise<OrganizationBillingCustomerRecord | undefined> {
+    return this.organizationBillingCustomers.get(organizationId);
   }
 
   async listProjectsForOrganization(organizationId: string) {
-    return Array.from(this.projects.values()).filter(
-      (project) => project.organizationId === organizationId,
+    const runtimeProjects = new Set(
+      Array.from(this.organizationTriggers.values()).map(
+        ({ runtimeProjectId }) => runtimeProjectId,
+      ),
     );
+    return Array.from(this.projects.values()).filter(
+      (project) =>
+        project.organizationId === organizationId &&
+        project.status === "active" &&
+        !runtimeProjects.has(project.id),
+    );
+  }
+
+  async listPendingProjectTriggerMigrations(): Promise<PendingProjectTriggerMigration[]> {
+    const runtimeProjects = new Set(
+      Array.from(this.organizationTriggers.values()).map(
+        ({ runtimeProjectId }) => runtimeProjectId,
+      ),
+    );
+    return Array.from(this.projects.values()).flatMap((project) => {
+      if (
+        project.status !== "active" ||
+        project.activeConfigurationRevisionId === null ||
+        this.migratedProjects.has(project.id) ||
+        runtimeProjects.has(project.id)
+      ) {
+        return [];
+      }
+      const revision = this.configurationRevisions.get(project.activeConfigurationRevisionId);
+      return revision === undefined ? [] : [{ project, revision }];
+    });
+  }
+
+  async migrateProjectTriggers(
+    input: MigrateProjectTriggersInput,
+  ): Promise<OrganizationTriggerRecord[]> {
+    if (this.migratedProjects.has(input.projectId)) return [];
+    const project = this.projects.get(input.projectId);
+    if (
+      project === undefined ||
+      project.organizationId !== input.organizationId ||
+      project.activeConfigurationRevisionId !== input.configurationRevisionId
+    ) {
+      throw new Error("project configuration changed during trigger migration");
+    }
+    const compiledCandidates = input.triggers.map((candidate) => {
+      if (candidate.format !== "single_run" && candidate.format !== "legacy_multistep") {
+        throw new Error("invalid organization trigger format");
+      }
+      return parseCompiledHubConfig(candidate.normalizedConfiguration);
+    });
+    const legacyRoutes = this.projectTriggerRoutes.get(input.projectId) ?? [];
+    const candidateRoutes = input.triggers.map((candidate, index) => {
+      const configuredEventName = compiledCandidates[index]!.triggers[0]?.on;
+      if (configuredEventName === undefined) {
+        throw new Error(`migrated trigger ${candidate.name} has no configured event`);
+      }
+      return legacyRoutes
+        .filter((route) => route.triggerName === candidate.name)
+        .map(
+          (route): OrganizationTriggerRoute => ({
+            provider: route.provider,
+            connectionId: route.connectionId,
+            resourceId: route.resourceId,
+            configuredEventName,
+          }),
+        );
+    });
+    if (
+      candidateRoutes.reduce((total, routes) => total + routes.length, 0) !== legacyRoutes.length
+    ) {
+      throw new Error("project trigger routes do not match migrated triggers");
+    }
+    const created: OrganizationTriggerRecord[] = [];
+    for (const [index, candidate] of input.triggers.entries()) {
+      const name = this.availableMigratedTriggerName(
+        input.organizationId,
+        input.projectSlug,
+        candidate.name,
+      );
+      const now = this.now();
+      const triggerId = randomUUID();
+      const revisionId = randomUUID();
+      const runtimeProjectId = this.createTriggerRuntimeProject({
+        organizationId: input.organizationId,
+        name: candidate.name,
+        createdByUserId: null,
+      });
+      const trigger: OrganizationTriggerRecord = {
+        id: triggerId,
+        organizationId: input.organizationId,
+        name,
+        enabled: candidate.enabled,
+        format: candidate.format,
+        runtimeProjectId,
+        activeRevisionId: revisionId,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const revision: OrganizationTriggerRevisionRecord = {
+        id: revisionId,
+        triggerId,
+        organizationId: input.organizationId,
+        version: 1,
+        yaml: candidate.yaml,
+        normalizedConfiguration: candidate.normalizedConfiguration,
+        contentHash: candidate.contentHash,
+        sourceKind: "project_migration",
+        sourceEvidence: candidate.sourceEvidence,
+        createdByUserId: null,
+        createdAt: now,
+      };
+      this.organizationTriggers.set(trigger.id, trigger);
+      this.organizationTriggerRevisions.set(revision.id, revision);
+      const routes = candidateRoutes[index]!;
+      this.organizationTriggerRoutes.set(trigger.id, routes);
+      const runtimeRevision = await this.insertProjectConfigurationRevision({
+        projectId: runtimeProjectId,
+        sourceKind: "manual",
+        sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
+        rawYaml: candidate.yaml,
+        normalizedConfiguration: candidate.normalizedConfiguration,
+        contentHash: candidate.contentHash,
+      });
+      const configuration = compiledCandidates[index]!;
+      await this.activateProjectConfigurationRevision(
+        runtimeProjectId,
+        runtimeRevision.id,
+        routes.map((route) => ({
+          provider: route.provider,
+          connectionId: route.connectionId,
+          resourceId: route.resourceId,
+          triggerName:
+            configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
+            configuration.triggers[0]?.name ??
+            candidate.name,
+        })),
+      );
+      created.push(trigger);
+    }
+    this.projectTriggerRoutes.delete(input.projectId);
+    this.projects.set(input.projectId, {
+      ...project,
+      status: "archived",
+      activeConfigurationRevisionId: null,
+      archivedAt: this.now(),
+      updatedAt: this.now(),
+    });
+    this.migratedProjects.add(input.projectId);
+    return created;
+  }
+
+  async listOrganizationTriggers(organizationId: string): Promise<OrganizationTriggerRecord[]> {
+    return Array.from(this.organizationTriggers.values()).filter(
+      (trigger) => trigger.organizationId === organizationId,
+    );
+  }
+
+  async findOrganizationTriggerRevision(
+    triggerId: string,
+    revisionId: string,
+  ): Promise<OrganizationTriggerRevisionRecord | undefined> {
+    const revision = this.organizationTriggerRevisions.get(revisionId);
+    return revision?.triggerId === triggerId ? revision : undefined;
+  }
+
+  async findOrganizationTriggerMigrationRevision(
+    triggerId: string,
+  ): Promise<OrganizationTriggerRevisionRecord | undefined> {
+    return Array.from(this.organizationTriggerRevisions.values())
+      .filter(
+        (revision) =>
+          revision.triggerId === triggerId && revision.sourceKind === "project_migration",
+      )
+      .sort((left, right) => left.version - right.version)[0];
+  }
+
+  async saveOrganizationTrigger(
+    input: SaveOrganizationTriggerInput,
+  ): Promise<OrganizationTriggerRecord> {
+    const existing =
+      input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
+    if (existing !== undefined && existing.organizationId !== input.organizationId) {
+      throw new Error("organization trigger not found");
+    }
+    if (
+      Array.from(this.organizationTriggers.values()).some(
+        (trigger) =>
+          trigger.organizationId === input.organizationId &&
+          trigger.name === input.name &&
+          trigger.id !== input.triggerId,
+      )
+    ) {
+      throw new Error("trigger name already exists");
+    }
+    const now = this.now();
+    const triggerId = existing?.id ?? randomUUID();
+    const runtimeProjectId =
+      existing?.runtimeProjectId ??
+      this.createTriggerRuntimeProject({
+        organizationId: input.organizationId,
+        name: input.name,
+        createdByUserId: input.createdByUserId,
+      });
+    const revisionId = randomUUID();
+    const version =
+      Math.max(
+        0,
+        ...Array.from(this.organizationTriggerRevisions.values())
+          .filter((revision) => revision.triggerId === triggerId)
+          .map((revision) => revision.version),
+      ) + 1;
+    const revision: OrganizationTriggerRevisionRecord = {
+      id: revisionId,
+      triggerId,
+      organizationId: input.organizationId,
+      version,
+      yaml: input.yaml,
+      normalizedConfiguration: input.normalizedConfiguration,
+      contentHash: input.contentHash,
+      sourceKind: input.sourceKind,
+      sourceEvidence: input.sourceEvidence,
+      createdByUserId: input.createdByUserId,
+      createdAt: now,
+    };
+    const trigger: OrganizationTriggerRecord = {
+      id: triggerId,
+      organizationId: input.organizationId,
+      name: input.name,
+      enabled: input.enabled,
+      format: input.format,
+      runtimeProjectId,
+      activeRevisionId: revisionId,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.organizationTriggerRevisions.set(revision.id, revision);
+    this.organizationTriggers.set(trigger.id, trigger);
+    this.organizationTriggerRoutes.set(trigger.id, [...input.routes]);
+    const runtimeRevision = await this.insertProjectConfigurationRevision({
+      projectId: runtimeProjectId,
+      sourceKind: input.sourceKind,
+      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
+      rawYaml: input.yaml,
+      normalizedConfiguration: input.normalizedConfiguration,
+      contentHash: input.contentHash,
+      createdByUserId: input.createdByUserId,
+    });
+    const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
+    await this.activateProjectConfigurationRevision(
+      runtimeProjectId,
+      runtimeRevision.id,
+      input.routes.map((route) => ({
+        provider: route.provider,
+        connectionId: route.connectionId,
+        resourceId: route.resourceId,
+        triggerName:
+          configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
+          configuration.triggers[0]?.name ??
+          input.name,
+      })),
+    );
+    return trigger;
+  }
+
+  private createTriggerRuntimeProject(input: {
+    organizationId: string;
+    name: string;
+    createdByUserId: string | null;
+  }): string {
+    const id = randomUUID();
+    const now = this.now();
+    this.projects.set(id, {
+      id,
+      organizationId: input.organizationId,
+      name: `Trigger runtime: ${input.name}`,
+      slug: `trigger-${id.slice(0, 8)}`,
+      status: "active",
+      createdByUserId: input.createdByUserId,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      activeConfigurationRevisionId: null,
+    });
+    this.configurationAuthorities.set(id, "manual");
+    return id;
+  }
+
+  private availableMigratedTriggerName(
+    organizationId: string,
+    projectSlug: string,
+    requestedName: string,
+  ): string {
+    const occupied = new Set(
+      Array.from(this.organizationTriggers.values())
+        .filter((trigger) => trigger.organizationId === organizationId)
+        .map((trigger) => trigger.name),
+    );
+    if (!occupied.has(requestedName)) return requestedName;
+    const base = `${projectSlug}-${requestedName}`;
+    if (!occupied.has(base)) return base;
+    let suffix = 2;
+    while (occupied.has(`${base}-${String(suffix)}`)) suffix += 1;
+    return `${base}-${String(suffix)}`;
   }
 
   async findProjectForOrganization(organizationId: string, projectId: string) {
@@ -2477,6 +3532,9 @@ class MemoryDatabase implements Database {
       slack: Array.from(this.slackConnections.values()).filter(
         (connection) => connection.organizationId === organizationId,
       ),
+      linear: Array.from(this.linearConnections.values()).filter(
+        (connection) => connection.organizationId === organizationId,
+      ),
     };
   }
 
@@ -2589,7 +3647,8 @@ class MemoryDatabase implements Database {
         (receipt) =>
           receipt.organizationId === organizationId &&
           receipt.droppedReason !== null &&
-          isProviderEventDropReasonCode(receipt.droppedReason) &&
+          // Same codes as the Postgres query: a stop receipt was handled, not left unrouted.
+          isUnroutedProviderEventDropReasonCode(receipt.droppedReason) &&
           !routedReceiptIds.has(receipt.id),
       )
       .sort(
@@ -2640,6 +3699,35 @@ class MemoryDatabase implements Database {
     return connectionPersistenceUnavailable();
   }
 
+  bindLinearConnection(_input: BindLinearConnectionInput): Promise<void> {
+    return connectionPersistenceUnavailable();
+  }
+
+  completeLinearProviderApplication(_input: CompleteLinearProviderApplicationInput): Promise<void> {
+    return connectionPersistenceUnavailable();
+  }
+
+  updateLinearConnectionTokens(_input: UpdateLinearConnectionTokensInput): Promise<void> {
+    return connectionPersistenceUnavailable();
+  }
+
+  withLinearConnectionRefresh<T>(
+    linearOrganizationId: string,
+    operation: LinearConnectionRefreshOperation<T>,
+  ): Promise<T> {
+    return this.withAdvisoryLock(
+      JSON.stringify(["paseo-connection", "linear", "external", linearOrganizationId]),
+      async () => {
+        const connection = this.linearConnections.get(linearOrganizationId);
+        return operation(connection, async (input) => {
+          const current = this.linearConnections.get(linearOrganizationId);
+          if (current === undefined) throw new Error("Linear connection unavailable");
+          this.linearConnections.set(linearOrganizationId, { ...current, ...input });
+        });
+      },
+    );
+  }
+
   disconnectConnection(
     _provider: ConnectionProvider,
     _connectionId: string,
@@ -2660,11 +3748,23 @@ class MemoryDatabase implements Database {
     return Promise.resolve(this.slackConnections.get(_teamId));
   }
 
+  findLinearConnection(_linearOrganizationId: string): Promise<LinearConnectionRecord | undefined> {
+    return Promise.resolve(this.linearConnections.get(_linearOrganizationId));
+  }
+
   findSlackConnectionForOrganization(
     organizationId: string,
     teamId: string,
   ): Promise<SlackConnectionRecord | undefined> {
     const connection = this.slackConnections.get(teamId);
+    return Promise.resolve(connection?.organizationId === organizationId ? connection : undefined);
+  }
+
+  findLinearConnectionForOrganization(
+    organizationId: string,
+    linearOrganizationId: string,
+  ): Promise<LinearConnectionRecord | undefined> {
+    const connection = this.linearConnections.get(linearOrganizationId);
     return Promise.resolve(connection?.organizationId === organizationId ? connection : undefined);
   }
 
@@ -2689,11 +3789,16 @@ class MemoryDatabase implements Database {
   }
 
   private async acceptMemoryEvent(
-    input: AcceptGitHubEventInput | AcceptDiscordEventInput | AcceptSlackEventInput,
+    input:
+      | AcceptGitHubEventInput
+      | AcceptDiscordEventInput
+      | AcceptSlackEventInput
+      | AcceptLinearEventInput,
     organizationId: string | undefined,
     connectionId: string | undefined,
     resourceId: string | null,
     reason: string | undefined,
+    candidateResourceIds: readonly string[] = resourceId === null ? [] : [resourceId],
   ): Promise<ProviderEventAcceptance> {
     const receiptId = this.findReceiptId(organizationId, input.deliveryId, input.signatureHash);
     if (receiptId !== undefined) {
@@ -2752,7 +3857,7 @@ class MemoryDatabase implements Database {
                 (route) =>
                   route.provider === provider &&
                   route.connectionId === connectionId &&
-                  (route.resourceId === null || route.resourceId === resourceId),
+                  (route.resourceId === null || candidateResourceIds.includes(route.resourceId)),
               )
               .map((route) => Object.assign({}, route, { projectId }))
           : [];
@@ -2876,16 +3981,31 @@ function emptyHubActionAcknowledgements(): AgentExecutionHubAcknowledgements {
   return { terminalAt: null, idleAt: null, finishExecutionCall: null };
 }
 
+function acknowledgementMatchesTurn(
+  acknowledgement: AgentExecutionHubAcknowledgementInput,
+  current: AgentExecutionHubAcknowledgements,
+): boolean {
+  return (
+    acknowledgement.kind !== "finish_execution" ||
+    acknowledgement.expectedTurnId === undefined ||
+    acknowledgement.expectedTurnId === (current.turn?.id ?? null)
+  );
+}
+
 function connectionPersistenceUnavailable(): never {
   throw new Error("connection persistence requires PostgreSQL");
 }
 
 function providerForInput(
-  input: AcceptGitHubEventInput | AcceptDiscordEventInput | AcceptSlackEventInput,
-): "github" | "discord" | "slack" {
+  input:
+    | AcceptGitHubEventInput
+    | AcceptDiscordEventInput
+    | AcceptSlackEventInput
+    | AcceptLinearEventInput,
+): "github" | "discord" | "slack" | "linear" {
   if ("installationId" in input) return "github";
   if ("guildId" in input) return "discord";
-  return "slack";
+  return "linearOrganizationId" in input ? "linear" : "slack";
 }
 
 function githubDropReason(
@@ -2913,6 +4033,22 @@ function slackDropReason(
 ): string | undefined {
   if (input.dropReason !== undefined) return input.dropReason;
   if (binding === undefined) return "slack_unbound";
+  return undefined;
+}
+
+function linearDropReason(
+  input: AcceptLinearEventInput,
+  binding: LinearConnectionRecord | undefined,
+): string | undefined {
+  if (input.dropReason !== undefined) return input.dropReason;
+  if (binding === undefined) return "linear_unbound";
+  if (
+    linearConnectionRequiresReauthorization(binding, input.receivedAt) ||
+    (input.source === "linear.agent_session" &&
+      !hasRequiredLinearAgentSessionScopes(binding.scopes))
+  ) {
+    return "configuration_unavailable";
+  }
   return undefined;
 }
 
@@ -2981,4 +4117,28 @@ function attachmentSourceKey(
   sourceId: string,
 ): string {
   return `${providerEventReceiptId}:${provider}:${sourceId}`;
+}
+
+/** The triggering comment a Linear trigger context records; mirrors the SQL JSON path. */
+function linearCommentIdOf(triggerContext: unknown): string | undefined {
+  const event = nestedRecord(nestedRecord(triggerContext)?.["event"]);
+  const comment = nestedRecord(nestedRecord(event?.["linear"])?.["comment"]);
+  const id = comment?.["id"];
+  return typeof id === "string" ? id : undefined;
+}
+
+/** The comments a persisted agent-session event names: the thread root and the turn's source. */
+function linearAgentSessionCommentIdsOf(payload: unknown): string[] {
+  const session = nestedRecord(nestedRecord(payload)?.["agentSession"]);
+  return [session?.["rootCommentId"], session?.["sourceCommentId"]].filter(
+    (id): id is string => typeof id === "string",
+  );
+}
+
+function nestedRecord(value: unknown): Record<string, unknown> | undefined {
+  return isPlainRecord(value) ? value : undefined;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

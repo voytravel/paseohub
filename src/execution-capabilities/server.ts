@@ -9,6 +9,12 @@ import { registerResponseLifecycle } from "../http/response-lifecycle.js";
 import { reportFailure, withReference } from "../failures/index.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
 import {
+  OUTPUT_DELIVERY_FAILED_REASON,
+  describeRequiredOutputDeliveryFailures,
+  failedRequiredOutputDeliveries,
+  missingRequiredOutputs,
+} from "./required-outputs.js";
+import {
   executionToolDefinitions,
   finishExecutionToolName,
   type MaterializedOutputCapability,
@@ -92,6 +98,23 @@ export function createExecutionCapabilityServer(
       }
     },
   };
+}
+
+const OUTPUT_DELIVERY_REASON_LIMIT = 200;
+
+/**
+ * The provider's own explanation, on one line, so the agent can adjust its next call instead of
+ * retrying blindly (for example when the provider enforces a threading rule).
+ */
+function outputDeliveryReason(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const line = error.message.replace(/\s+/gu, " ").trim();
+  if (line.length === 0) return "";
+  const bounded =
+    line.length > OUTPUT_DELIVERY_REASON_LIMIT
+      ? `${line.slice(0, OUTPUT_DELIVERY_REASON_LIMIT - 1)}…`
+      : line;
+  return ` Provider said: "${bounded}".`;
 }
 
 function outputCapabilityMessage(error: unknown): string {
@@ -180,8 +203,10 @@ async function finishExecutionCall(
   materializedOutputs: readonly MaterializedOutputCapability[],
 ) {
   try {
-    const missingOutputs = missingRequiredOutputs(execution, materializedOutputs);
-    if (missingOutputs.length > 0) {
+    // An output the agent never attempted is still recoverable: name its tool.
+    // One whose delivery failed is not; completion then ends the run as failed.
+    const missingOutputs = missingRequiredOutputTools(execution, materializedOutputs);
+    if (missingOutputs.length > 0 && failedRequiredOutputDeliveries(execution).length === 0) {
       reportFailure(
         new Error("required execution outputs are missing"),
         {
@@ -199,6 +224,11 @@ async function finishExecutionCall(
       token,
       ...(output === undefined ? {} : { output }),
     });
+    // A conversational execution stays `running` on purpose: the turn ended, the conversation did
+    // not. Treating that as a failure would tell the agent its answer did not land.
+    if (execution.launchIntent?.keepAliveBetweenTurns === true && completed.status === "running") {
+      return toolSuccess("Turn finished. This session stays open; the next message reaches you.");
+    }
     if (completed.status !== "succeeded") {
       reportFailure(
         new Error(`execution completion ended with status ${completed.status}`),
@@ -220,6 +250,9 @@ async function finishExecutionCall(
     });
     return toolSuccess("Execution finished");
   } catch (error) {
+    if (isOutputDeliveryFailure(error)) {
+      return toolFailure(outputDeliveryFailureMessage(failedRequiredOutputDeliveries(execution)));
+    }
     const failure = reportFailure(error, {
       operation: "execution_capability.finish",
       component: "execution_capabilities",
@@ -241,12 +274,34 @@ async function executeOutputCall(
   output: MaterializedOutputCapability,
   args: Record<string, unknown>,
 ) {
-  const attempt = await options.database.beginAgentExecutionOutput(
-    execution.id,
-    output.declaration.type,
-    output.declaration.max,
-    options.now?.() ?? new Date(),
+  // Bind context and attempt to one input under the same lock as prompt delivery.
+  const reservation = await options.database.withAdvisoryLock(
+    `execution.prompt:${execution.id}`,
+    async () => {
+      const current = await options.database.findAgentExecutionById(execution.id);
+      if (
+        current === undefined ||
+        current.hubActionAcknowledgements.turn?.id !== execution.hubActionAcknowledgements.turn?.id
+      )
+        return undefined;
+      const attempt = await options.database.beginAgentExecutionOutput(
+        current.id,
+        output.declaration.type,
+        output.declaration.max,
+        options.now?.() ?? new Date(),
+      );
+      return {
+        attempt,
+        outputContext: structuredClone(current.outputContext),
+        triggerContext: structuredClone(current.triggerContext),
+      };
+    },
   );
+  if (reservation === undefined)
+    return toolFailure(
+      "A newer input arrived before this reply was reserved. Review the latest input before replying.",
+    );
+  const { attempt } = reservation;
   if (attempt === undefined) {
     reportFailure(
       new Error("execution output limit reached"),
@@ -260,18 +315,21 @@ async function executeOutputCall(
     return toolFailure(`Output limit reached for ${output.declaration.type}`);
   }
   try {
-    await options.outputs.execute({
+    const result = await options.outputs.execute({
       agentExecutionId: execution.id,
       attemptId: attempt.id,
       toolType: output.declaration.type,
       args,
-      outputContext: execution.outputContext,
+      outputContext: reservation.outputContext,
+      triggerContext: reservation.triggerContext,
     });
-    const recorded = await options.database.completeAgentExecutionOutput(
-      execution.id,
-      attempt.id,
-      options.now?.() ?? new Date(),
-    );
+    const recorded =
+      result?.deliveryAcknowledged === true ||
+      (await options.database.completeAgentExecutionOutput(
+        execution.id,
+        attempt.id,
+        options.now?.() ?? new Date(),
+      ));
     if (recorded === undefined) throw new Error("output emission could not be recorded");
     return toolSuccess("Output sent");
   } catch (error) {
@@ -295,7 +353,7 @@ async function executeOutputCall(
     }
     return toolFailure(
       withReference(
-        `Output delivery failed. Check the provider connection and output configuration before calling \`${toolName}\` again.`,
+        `Output delivery failed. Check the provider connection and output configuration before calling \`${toolName}\` again.${outputDeliveryReason(error)}`,
         failure.requestId,
       ),
     );
@@ -360,20 +418,17 @@ function validationMessage(errors: readonly ErrorObject[] | null | undefined): s
     : `Invalid arguments for tool: ${messages.join("; ")}`;
 }
 
-function missingRequiredOutputs(
+function missingRequiredOutputTools(
   execution: AgentExecutionRecord,
   materializedOutputs: readonly MaterializedOutputCapability[],
 ): readonly { type: string; toolName: string }[] {
   const toolsByType = new Map(
     materializedOutputs.map((output) => [output.declaration.type, output.capability.tool.name]),
   );
-  return (execution.launchIntent?.allowOutputs ?? [])
-    .filter((output) => output.required === true)
-    .filter((output) => (execution.outputEmissions[output.type] ?? 0) < 1)
-    .map((output) => ({
-      type: output.type,
-      toolName: toolsByType.get(output.type) ?? "unavailable",
-    }));
+  return missingRequiredOutputs(execution).map((output) => ({
+    type: output.type,
+    toolName: toolsByType.get(output.type) ?? "unavailable",
+  }));
 }
 
 function requiredOutputsGuidance(
@@ -383,6 +438,22 @@ function requiredOutputsGuidance(
     .map((output) => `${output.type} (call \`${output.toolName}\`)`)
     .join(", ");
   return `Required output missing: ${missing}. Call the named Hub tool, then retry \`finish_execution\`.`;
+}
+
+/** The completion authority ended the execution because a required output was never delivered. */
+function isOutputDeliveryFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.name === "AgentExecutionCompletionFailure" &&
+    "reason" in error &&
+    error.reason === OUTPUT_DELIVERY_FAILED_REASON
+  );
+}
+
+function outputDeliveryFailureMessage(
+  failures: ReturnType<typeof failedRequiredOutputDeliveries>,
+): string {
+  return `Execution failed: required output not delivered (${describeRequiredOutputDeliveryFailures(failures)}). The run is recorded as failed and accepts no further tool calls.`;
 }
 
 function readBearerToken(header: string | undefined): string | undefined {

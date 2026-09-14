@@ -14,14 +14,15 @@ export function createDatabasePublicOperationRepository(
         .map(({ id, name, slug }) => ({ id, name, slug }));
     },
     async listConfigurationResources(organizationId) {
-      const [connections, repositories, daemons] = await Promise.all([
-        database.organizationConnectionUsage(organizationId),
-        database.listGitHubRepositories(organizationId),
+      const [{ connections, repositories }, daemons] = await Promise.all([
+        providerResources(database, organizationId),
         database.listDaemonsForOrganization(organizationId),
       ]);
       return {
         daemons: daemons
-          .filter(({ status }) => status === "active")
+          .filter(
+            ({ status, permissions }) => status === "active" && permissions.includes("hub.execute"),
+          )
           .map(({ id, slug }) => ({ id, slug })),
         github: connections.github.map(({ id, slug, accountLogin, accountType }) => ({
           slug,
@@ -33,13 +34,43 @@ export function createDatabasePublicOperationRepository(
         })),
         discord: connections.discord.map(({ slug, guildName }) => ({ slug, guildName })),
         slack: connections.slack.map(({ slug, teamName }) => ({ slug, teamName })),
+        linear: connections.linear.map(({ slug, linearOrganizationName }) => ({
+          slug,
+          organizationName: linearOrganizationName,
+        })),
       };
     },
-    async findActiveProject(organizationId, projectSlug) {
+    async listSetupResources(organizationId) {
+      const { connections, repositories } = await providerResources(database, organizationId);
+      return {
+        github: connections.github.map(({ id, slug, accountLogin, accountType }) => ({
+          slug,
+          accountLogin,
+          accountType,
+          repositories: repositories
+            .filter(({ connectionId }) => connectionId === id)
+            .map(({ fullName }) => fullName),
+        })),
+        discord: connections.discord.map(({ guildId, guildName }) => ({ guildId, guildName })),
+        slack: connections.slack.map(({ teamId, teamName }) => ({ teamId, teamName })),
+      };
+    },
+    async resolveManualRunProject(organizationId, triggerName, projectSlug) {
+      const organizationTrigger = (await database.listOrganizationTriggers(organizationId)).find(
+        ({ name }) => name === triggerName,
+      );
+      if (organizationTrigger !== undefined) {
+        const runtimeProject = await database.findProjectById(organizationTrigger.runtimeProjectId);
+        if (runtimeProject?.status === "active") {
+          return organizationTrigger.enabled
+            ? { status: "resolved", id: organizationTrigger.runtimeProjectId }
+            : { status: "disabled" };
+        }
+      }
       const project = await database.findProjectBySlugForOrganization(organizationId, projectSlug);
       return project === undefined || project.status !== "active"
         ? undefined
-        : { id: project.id, slug: project.slug };
+        : { status: "resolved", id: project.id };
     },
     resolveDeploymentProject: (input) => deploymentProjects.resolve(input),
     async findManualRun(providerEventReceiptId, trigger) {
@@ -61,4 +92,12 @@ export function createDatabasePublicOperationRepository(
       return issued ? "issued" : "credential_revoked";
     },
   };
+}
+
+async function providerResources(database: Database, organizationId: string) {
+  const [connections, repositories] = await Promise.all([
+    database.organizationConnectionUsage(organizationId),
+    database.listGitHubRepositories(organizationId),
+  ]);
+  return { connections, repositories };
 }

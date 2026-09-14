@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { validateHeaderName, type IncomingMessage } from "node:http";
-import { join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Duplex } from "node:stream";
 import type { Logger } from "pino";
 import type { RuntimeConfig } from "./config/index.js";
@@ -32,8 +32,6 @@ import { composeEntitlements, type ComposedEntitlements } from "./auth/entitleme
 import { readInstanceAuthPolicy } from "./auth/instance-policy.js";
 import { createRuntimeConfiguration } from "./runtime-configuration/index.js";
 import { CompositionResources } from "./composition-resources.js";
-import { loadRuntimeEnvironment, type RuntimeEnvironmentSource } from "./runtime-environment.js";
-import { isCommandLineEntrypoint } from "./command-line.js";
 import {
   DynamicProviderRuntime,
   activateProviderApplicationsAtStartup,
@@ -45,15 +43,11 @@ import {
   resolveCallbackOrigin,
 } from "./provider-applications/index.js";
 import { createSlackSocketInstallationVerifier } from "./providers/slack/installation.js";
+import { resolveHubDataDirectory } from "./data-directory.js";
+import { composeInvitationMailer } from "./invitations/index.js";
+import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 
-export interface ProductionRuntimeOptions {
-  environmentSource: RuntimeEnvironmentSource;
-}
-
-export function startProductionRuntime(
-  options: ProductionRuntimeOptions = { environmentSource: "process-and-dotenv" },
-): Promise<ApplicationRuntime> {
-  loadRuntimeEnvironment(options.environmentSource);
+export function startProductionRuntime(): Promise<ApplicationRuntime> {
   return startApplication(createProductionRuntime);
 }
 
@@ -65,9 +59,8 @@ export async function handleDaemonUpgrade(
   request: IncomingMessage,
   socket: Duplex,
   head: Buffer,
-  options: ProductionRuntimeOptions = { environmentSource: "process-and-dotenv" },
 ): Promise<void> {
-  const runtime = await startProductionRuntime(options);
+  const runtime = await startProductionRuntime();
   if (runtime.hub.handleUpgrade === null) {
     socket.destroy();
     return;
@@ -81,10 +74,20 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const config = loadRuntimeConfig();
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close());
+    // Operators retaining project bundles can defer the organization-trigger migration.
+    // Keep this guard in source as well as derived images so rebuilding preserves that choice.
+    const migration =
+      process.env["PASEO_HUB_MIGRATE_PROJECT_TRIGGERS"] === "0"
+        ? { projects: 0, triggers: 0, legacyMultistepTriggers: 0 }
+        : await migrateLegacyProjectTriggers(database);
+    if (migration.projects > 0) {
+      logger.info(migration, "migrated project configurations to organization triggers");
+    }
     const identity = await resolveHubIdentity(runtime, readPort());
     const entitlements = composeEntitlements(database, runtime);
     resources.own(() => entitlements.close());
     const billingConfig = readBillingConfig();
+    const invitationMailer = composeInvitationMailer();
     const billing =
       billingConfig === undefined
         ? null
@@ -112,6 +115,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       identity,
       config.trustedClientIpHeader,
       billing,
+      invitationMailer,
     );
     resources.own(() => auth.close());
     await auth.initialize?.();
@@ -187,6 +191,7 @@ function createProductionAuthServer(
   identity: HubIdentity,
   trustedClientIpHeader: string | undefined,
   billing: BillingRuntime | null,
+  invitationMailer: ReturnType<typeof composeInvitationMailer>,
 ) {
   return createAuthServer({
     database,
@@ -196,6 +201,7 @@ function createProductionAuthServer(
     baseURL: identity.appUrl,
     policy: authPolicy,
     ...(trustedClientIpHeader === undefined ? {} : { trustedClientIpHeader }),
+    ...(invitationMailer === undefined ? {} : { invitationMailer }),
     // Hosted: new organizations start on the Free plan from the catalog mirror. Self-hosted
     // (billing null) keeps the createAuthServer default, which stamps unlimited.
     ...(billing === null
@@ -216,9 +222,7 @@ async function createDatabaseHandle(): Promise<DatabaseRuntimeBundle & { databas
     );
   }
 
-  const dataDirectory = resolvePath(
-    process.env["PASEO_HUB_DATA_DIR"] ?? join(process.cwd(), ".dev", "paseo-hub"),
-  );
+  const dataDirectory = resolveHubDataDirectory();
   return initializeDatabaseRuntime(
     () => embeddedDatabaseRuntime(dataDirectory),
     `database runtime ready: embedded (${dataDirectory})`,
@@ -299,12 +303,13 @@ async function main(): Promise<void> {
   await build.startProductionRuntime();
   const config = loadRuntimeConfig();
   const port = readPort();
-  const server = createFetchServer(
-    (request) => build.default.fetch(request),
-    config.trustedClientIpHeader === undefined
+  const canonicalRequestOrigin = nonEmptyEnvironment(process.env["PASEO_HUB_APP_URL"]);
+  const server = createFetchServer((request) => build.default.fetch(request), {
+    ...(config.trustedClientIpHeader === undefined
       ? {}
-      : { trustedClientIpHeader: config.trustedClientIpHeader },
-  );
+      : { trustedClientIpHeader: config.trustedClientIpHeader }),
+    ...(canonicalRequestOrigin === undefined ? {} : { canonicalRequestOrigin }),
+  });
   server.on("upgrade", (request, socket, head) => {
     void handleDaemonUpgradeRequest({
       request,
@@ -312,8 +317,10 @@ async function main(): Promise<void> {
       handle: () => build.handleDaemonUpgrade(request, socket, head),
     });
   });
+  const appUrl =
+    nonEmptyEnvironment(process.env["PASEO_HUB_APP_URL"]) ?? `http://localhost:${port}`;
   server.listen(port, config.bind, () => {
-    logger.info({ bind: config.bind, port }, "server started");
+    logger.info(`server started, available at: ${appUrl}`);
   });
 
   const stop = async () => {
@@ -396,9 +403,11 @@ function readPort(): number {
   return port;
 }
 
-if (isCommandLineEntrypoint(import.meta.url)) {
+export function runHubCommandLine(): void {
   main().catch((error: unknown) => {
     reportFailure(error, { operation: "server.startup.fatal", component: "server" });
     process.exit(1);
   });
 }
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) runHubCommandLine();

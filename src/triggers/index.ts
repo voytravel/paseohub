@@ -1,8 +1,9 @@
 import type { DurableProviderEvent } from "../db/types.js";
 import type { JsonValue } from "../config/compiler.js";
-import type { WorktreeTarget } from "../config/index.js";
+import type { WorktreeTarget, CompiledTriggerConfig } from "../config/index.js";
 import type { InvocationParseResult } from "./invocation.js";
 import type { ProviderEventDropReasonCode } from "./drop-reason.js";
+import type { HubExecutionAgentStreamEvent } from "../hub/protocol.js";
 
 export interface ExternalTrigger {
   providerEventReceiptId: string;
@@ -95,6 +96,13 @@ export function isRejectedTriggerProviderMatch<TriggerContext, OutputContext>(
 export interface TriggerProviderLifecycleResult {
   status: "succeeded" | "failed";
   summary?: string;
+  /**
+   * Outputs delivered by the run's agent executions, keyed by output type
+   * (for example `linear.reply`) and summed across workflow steps. Absent when
+   * the caller could not read the executions; providers must treat that as
+   * "unknown", not as "nothing was emitted".
+   */
+  outputEmissions?: Readonly<Record<string, number>>;
 }
 
 export type TriggerProviderReactionState = JsonValue | null;
@@ -142,6 +150,35 @@ export interface TriggerProvider<
   materializeContext?(
     launch: TriggerContextMaterialization<TriggerContext>,
   ): Promise<MaterializedContext>;
+  /**
+   * Whether an execution for this context should survive the end of a turn.
+   *
+   * True for a conversation the user keeps writing into (a Linear agent session), false for a
+   * surface that answers once (a Slack message, a GitHub comment). When true, `finish_execution`
+   * ends the turn and leaves the agent alive, so the next message reaches it with its context
+   * intact instead of starting a cold agent and replaying the thread as text.
+   */
+  keepsExecutionAliveBetweenTurns?(triggerContext: TriggerContext): boolean;
+  /**
+   * Stable name of the work this event is about — a Linear issue identifier, for instance.
+   *
+   * Used by worktree templates (`paseo.work.id`) so a worktree belongs to the issue rather than
+   * to one execution: every session and every message about that issue then iterates on the same
+   * branch, instead of each cutting a fresh copy of the default branch.
+   */
+  workKeyFor?(triggerContext: TriggerContext): string | undefined;
+  /** Permanent provider identity used when the workflow opts in to workspace reuse. */
+  workspaceKeyFor?(triggerContext: TriggerContext): string | undefined;
+  /** Retry a saved, unstarted single-step run against live work. True requires a durable input ACK. */
+  continuePendingRun?(input: {
+    organizationId: string;
+    projectId: string;
+    revisionId: string;
+    trigger: CompiledTriggerConfig;
+    triggerContext: TriggerContext;
+    outputContext: OutputContext;
+    prompt: string;
+  }): Promise<boolean>;
   onDispatchAccepted?(
     triggerContext: TriggerContext,
     outputContext: OutputContext,
@@ -164,6 +201,26 @@ export interface TriggerProvider<
     reason: string,
     reactionState?: TriggerProviderReactionState,
   ): Promise<TriggerProviderReactionResult>;
+  /**
+   * Called for every agent stream event of a live execution: assistant text, reasoning, tool
+   * calls, turn boundaries.
+   *
+   * The daemon already streams these to Hub, which until now only used them to push back the idle
+   * deadline. A provider whose surface is a live session panel (Linear) can mirror them so the
+   * user watches the work instead of a spinner; providers whose surface is a single message
+   * (Slack, GitHub) simply do not implement this.
+   *
+   * Contract: called in stream order, one execution at a time, and never awaited by the dispatch
+   * path in a way that can fail it — an implementation that throws is reported and ignored. It
+   * must be cheap: an agent emits hundreds of events per turn.
+   */
+  onAgentStreamEvent?(
+    triggerContext: TriggerContext,
+    outputContext: OutputContext,
+    event: HubExecutionAgentStreamEvent,
+    /** Durable execution identity for providers that coordinate mirrors with output delivery. */
+    executionId?: string,
+  ): Promise<void>;
   onAgentExecutionTerminal?(executionId: string, triggerContext: TriggerContext): Promise<void>;
   onMachineTerminated?(
     triggerContext: TriggerContext,

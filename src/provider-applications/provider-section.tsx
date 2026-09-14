@@ -19,6 +19,7 @@ import {
 import { FieldSet } from "../components/ui/field.js";
 import { Skeleton } from "../components/ui/skeleton.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
+import { linearConnectionActionLabels } from "../connections/linear-actions.js";
 import type { Result } from "../contract/respond.js";
 import { cn } from "../lib/utils.js";
 import {
@@ -215,9 +216,21 @@ export function ProviderSection({
     [activeGuide, fields, save, surface, view.configurationVersion],
   );
 
-  const startConnection = useCallback(() => {
-    connect.mutate({ data: { provider: guide.provider, organizationId, surface } });
-  }, [connect, guide.provider, organizationId, surface]);
+  const startConnection = useCallback(
+    (linearAgentSessions = false) => {
+      connect.mutate({
+        data: {
+          provider: guide.provider,
+          organizationId,
+          surface,
+          ...(guide.provider === "linear" && linearAgentSessions
+            ? { linearAgentSessions: true }
+            : {}),
+        },
+      });
+    },
+    [connect, guide.provider, organizationId, surface],
+  );
 
   const status = statusPresentation(view.status);
   // Once anything is saved the instructions become reference material and move behind a
@@ -300,7 +313,7 @@ function SlackTransportChoice({
 }) {
   return (
     <fieldset className="grid gap-3">
-      <legend className="text-sm font-medium">How should Slack reach Hub?</legend>
+      <legend className="text-sm">How should Slack reach Hub?</legend>
       <div className="grid gap-3 sm:grid-cols-2">
         {(
           [
@@ -325,7 +338,7 @@ function SlackTransportChoice({
               onChange={() => onChange(transport)}
             />
             <span className="grid gap-1">
-              <span className="font-medium">{label}</span>
+              <span>{label}</span>
               <span className="text-sm text-muted-foreground">{description}</span>
             </span>
           </label>
@@ -368,7 +381,7 @@ function SectionBody({
   busy: boolean;
   connecting: boolean;
   replaceRef: React.RefObject<HTMLButtonElement | null>;
-  onConnect: () => void;
+  onConnect: (linearAgentSessions?: boolean) => void;
   onRetry: () => void;
   onReplace: () => void;
 }) {
@@ -588,7 +601,7 @@ function PasteForm({
       className="grid gap-4 rounded-lg border bg-muted/30 p-4 lg:sticky lg:top-6"
     >
       <div className="grid gap-1">
-        <h3 className="font-medium">{replacing ? "Replace credentials" : guide.formTitle}</h3>
+        <h3>{replacing ? "Replace credentials" : guide.formTitle}</h3>
         {replacing ? (
           <p className="text-sm text-muted-foreground">
             Rotating secrets for the same app keeps your connections. Setting up a different app
@@ -654,19 +667,30 @@ function ConnectAction({
   view: ProviderApplicationView;
   busy: boolean;
   pending: boolean;
-  onConnect: () => void;
+  onConnect: (linearAgentSessions?: boolean) => void;
 }) {
   const label =
     view.connections.length > 0 ? guide.actions.connectAgain : (guide.actions.connect ?? undefined);
+  const linearActions = linearConnectionActionLabels(
+    guide.provider === "linear" && view.status === "actionNeeded",
+  );
   if (
     label === undefined ||
     (guide.provider === "slack" && view.identifiers["transport"] === "socket")
   )
     return null;
+  const connectionLabel = guide.provider === "linear" ? linearActions.baseline : label;
   return (
-    <Button type="button" disabled={busy} onClick={onConnect}>
-      {pending ? "Opening…" : label}
-    </Button>
+    <>
+      <Button type="button" disabled={busy} onClick={() => onConnect(false)}>
+        {pending ? "Opening…" : connectionLabel}
+      </Button>
+      {guide.provider === "linear" ? (
+        <Button type="button" variant="outline" disabled={busy} onClick={() => onConnect(true)}>
+          {pending ? "Opening…" : linearActions.agentSessions}
+        </Button>
+      ) : null}
+    </>
   );
 }
 
@@ -808,7 +832,7 @@ function InstructionGroup({
     <section className="grid min-w-0 gap-3">
       {group.title === undefined ? null : (
         <div className="grid gap-1 border-t pt-5">
-          <h3 className="font-medium">{group.title}</h3>
+          <h3>{group.title}</h3>
           {group.description === undefined ? null : (
             <p className="text-sm text-muted-foreground">{group.description}</p>
           )}
@@ -857,7 +881,7 @@ function StepBody({
         <dl className="mt-3 grid gap-x-4 gap-y-1.5 sm:grid-cols-[max-content_1fr]">
           {step.permissions.map((permission) => (
             <div key={permission.name} className="contents">
-              <dt className="font-medium text-foreground">{permission.name}</dt>
+              <dt className="text-foreground">{permission.name}</dt>
               <dd>{permission.access}</dd>
             </div>
           ))}
@@ -897,9 +921,9 @@ function StepBody({
 
 function Segment({ segment }: { segment: StepSegment }) {
   // Instruction prose is muted; the controls to find in the portal are not. That contrast is
-  // what makes a step scannable, and it is why not everything on the page is font-medium.
+  // what makes a step scannable without relying on font weight.
   if (segment.kind === "term") {
-    return <strong className="font-medium text-foreground">{segment.value}</strong>;
+    return <span className="text-foreground">{segment.value}</span>;
   }
   if (segment.kind === "link") {
     return (

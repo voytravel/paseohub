@@ -1,0 +1,712 @@
+import { z } from "zod";
+import type { LinearIssueDetails } from "../../providers/linear/client.js";
+import { LINEAR_WORK_FIELDS, linearIssueChanges } from "./issue-changes.js";
+
+const LinearIdSchema = z.string().min(1);
+const LinearActorSchema = z.object({ id: LinearIdSchema, name: z.string().optional() });
+const LinearIssueSchema = z.object({
+  id: LinearIdSchema,
+  identifier: z.string().min(1).optional(),
+  title: z.string(),
+  description: z.string().nullable(),
+  url: z.string().url().optional(),
+  projectId: LinearIdSchema.nullable(),
+  teamId: LinearIdSchema.nullable(),
+  stateId: LinearIdSchema.nullable(),
+  assigneeId: LinearIdSchema.nullable(),
+  delegateId: LinearIdSchema.nullable().optional(),
+  labelIds: z.array(LinearIdSchema),
+});
+const LinearIssuePreviousSchema = z.object({
+  projectId: LinearIdSchema.nullable().optional(),
+  teamId: LinearIdSchema.nullable().optional(),
+  stateId: LinearIdSchema.nullable().optional(),
+  assigneeId: LinearIdSchema.nullable().optional(),
+  labelIds: z.array(LinearIdSchema).optional(),
+});
+
+export const NormalizedLinearIssueEventSchema = z.object({
+  type: z.literal("issue"),
+  action: z.enum(["create", "update", "remove"]),
+  id: LinearIdSchema,
+  organizationId: LinearIdSchema,
+  actor: LinearActorSchema.nullable(),
+  issue: LinearIssueSchema,
+  updatedFrom: LinearIssuePreviousSchema,
+  /** Original Issue/create evidence; never hydrated from a later version of the issue. */
+  sourceStateId: LinearIdSchema.nullable().optional(),
+  sourceIssueUpdatedAt: z.string().datetime().optional(),
+  sourceActorIsBot: z.boolean().optional(),
+  changes: z
+    .array(
+      z.object({
+        field: z.enum(LINEAR_WORK_FIELDS),
+        before: z.union([z.string(), z.number(), z.array(z.string()), z.null()]),
+        after: z.union([z.string(), z.number(), z.array(z.string()), z.null()]),
+      }),
+    )
+    .optional(),
+  occurredAt: z.string().datetime().optional(),
+});
+
+export const NormalizedLinearCommentEventSchema = z.object({
+  type: z.literal("comment"),
+  action: z.enum(["create", "update", "remove"]),
+  id: LinearIdSchema,
+  organizationId: LinearIdSchema,
+  actor: LinearActorSchema.nullable(),
+  comment: z.object({
+    id: LinearIdSchema,
+    body: z.string(),
+    issueId: LinearIdSchema,
+    parentId: LinearIdSchema.nullable(),
+  }),
+  issue: LinearIssueSchema.nullable(),
+  /**
+   * Author IDs of the thread root and its replies (`user.id`, or `botActor.id` for integration
+   * comments). The webhook does not carry them: the trigger provider fills them when a filter
+   * needs them, and leaves them absent when the thread was not or could not be read.
+   */
+  threadAuthorIds: z.array(LinearIdSchema).optional(),
+  /**
+   * Whether the thread root is the root comment of an agent session. Linear materializes a
+   * session as a comment thread, so a reply there is already delivered as a session prompt.
+   * Filled together with `threadAuthorIds`.
+   */
+  threadIsAgentSession: z.boolean().optional(),
+  occurredAt: z.string().datetime().optional(),
+});
+
+export const NormalizedLinearAgentSessionEventSchema = z.object({
+  type: z.literal("agent_session"),
+  action: z.enum(["created", "prompted"]),
+  id: LinearIdSchema,
+  organizationId: LinearIdSchema,
+  actor: LinearActorSchema.nullable(),
+  agentSession: z.object({
+    id: LinearIdSchema,
+    appUserId: LinearIdSchema,
+    externalUrls: z.array(z.object({ label: z.string(), url: z.string().url() })).optional(),
+    issueId: LinearIdSchema,
+    status: z.string().min(1),
+    url: z.string().url().optional(),
+    /** The root comment of the thread the session is attached to, when it was opened from one. */
+    rootCommentId: LinearIdSchema.optional(),
+    /**
+     * The comment behind this turn. For `created`, the comment that opened the session: the root
+     * itself, or a reply that mentioned the app. For `prompted`, the reply Linear turned into the
+     * prompt.
+     */
+    sourceCommentId: LinearIdSchema.optional(),
+  }),
+  agentActivity: z
+    .object({
+      id: LinearIdSchema,
+      type: z.literal("prompt"),
+      body: z.string(),
+      createdAt: z.string().datetime(),
+      /** Linear's `stop` signal asks the agent to abandon the turn instead of starting one. */
+      signal: z.literal("stop").optional(),
+    })
+    .nullable(),
+  /** The canonical prompt given to the workflow. `created` uses Linear's promptContext. */
+  prompt: z.string().min(1),
+  /** The direct user text used only for input parsing and text filters. */
+  parserMessage: z.string().min(1),
+  promptContext: z.string().nullable(),
+  issue: LinearIssueSchema.nullable(),
+  occurredAt: z.string().datetime(),
+});
+
+export const NormalizedLinearEventSchema = z.discriminatedUnion("type", [
+  NormalizedLinearIssueEventSchema,
+  NormalizedLinearCommentEventSchema,
+  NormalizedLinearAgentSessionEventSchema,
+]);
+
+export type NormalizedLinearIssue = z.infer<typeof LinearIssueSchema>;
+export type NormalizedLinearIssueEvent = z.infer<typeof NormalizedLinearIssueEventSchema>;
+export type NormalizedLinearCommentEvent = z.infer<typeof NormalizedLinearCommentEventSchema>;
+export type NormalizedLinearAgentSessionEvent = z.infer<
+  typeof NormalizedLinearAgentSessionEventSchema
+>;
+export type NormalizedLinearEvent = z.infer<typeof NormalizedLinearEventSchema>;
+
+/**
+ * Linear's webhook data follows its entity model but not every event embeds related objects. This
+ * adapter accepts both the compact webhook shape and relation-expanded test/development payloads.
+ */
+export function normalizeLinearEvent(
+  payload: unknown,
+  eventName?: string | null,
+  hydratedIssue?: LinearIssueDetails,
+): NormalizedLinearEvent | undefined {
+  if (isAgentSessionEvent(payload, eventName)) {
+    return normalizeAgentSessionEvent(payload, hydratedIssue);
+  }
+  const envelope = readEnvelope(payload, eventName);
+  if (envelope === undefined) return undefined;
+  return envelope.kind === "issue"
+    ? normalizeIssueEvent(envelope, hydratedIssue)
+    : normalizeCommentEvent(envelope, hydratedIssue);
+}
+
+export function eventIssueId(event: NormalizedLinearEvent): string {
+  if (event.type === "issue") return event.issue.id;
+  return event.type === "comment" ? event.comment.issueId : event.agentSession.issueId;
+}
+
+export function eventProjectId(event: NormalizedLinearEvent): string | undefined {
+  return event.issue?.projectId ?? undefined;
+}
+
+export function eventTeamId(event: NormalizedLinearEvent): string | undefined {
+  return event.issue?.teamId ?? undefined;
+}
+
+/** A compact update may omit an unassigned relation; only a provider read can confirm it. */
+export function linearIssueNeedsAssigneeHydration(
+  payload: unknown,
+  eventName?: string | null,
+): boolean {
+  const envelope = readEnvelope(payload, eventName);
+  return envelope !== undefined && hasOmittedAssigneeChange(envelope);
+}
+
+function hasOmittedAssigneeChange(envelope: LinearEnvelope): boolean {
+  return (
+    envelope.kind === "issue" &&
+    envelope.action === "update" &&
+    readString(asRecord(envelope.payload["updatedFrom"])?.["assigneeId"]) !== undefined &&
+    !hasOwn(envelope.data, "assigneeId") &&
+    !hasOwn(envelope.data, "assignee")
+  );
+}
+
+/** Distinguish a complete projectless event from a compact event that still needs hydration. */
+export function hasExplicitNullLinearProject(payload: unknown, eventName?: string | null): boolean {
+  if (!isRecord(payload)) return false;
+  let issue: Record<string, unknown> | undefined;
+  if (isAgentSessionEvent(payload, eventName)) {
+    issue = asRecord(asRecord(payload["agentSession"])?.["issue"]);
+  } else {
+    const envelope = readEnvelope(payload, eventName);
+    if (envelope === undefined) return false;
+    issue = envelope.kind === "issue" ? envelope.data : asRecord(envelope.data["issue"]);
+  }
+  return (
+    issue !== undefined &&
+    ((hasOwn(issue, "projectId") && issue["projectId"] === null) ||
+      (hasOwn(issue, "project") && issue["project"] === null))
+  );
+}
+
+interface LinearEnvelope {
+  kind: "issue" | "comment";
+  action: "create" | "update" | "remove";
+  organizationId: string;
+  payload: Record<string, unknown>;
+  data: Record<string, unknown>;
+  occurredAt?: string;
+}
+
+function readEnvelope(
+  payload: unknown,
+  eventName: string | null | undefined,
+): LinearEnvelope | undefined {
+  if (!isRecord(payload)) return undefined;
+  const action = readAction(payload["action"]);
+  const organizationId = readString(payload["organizationId"]);
+  const data = asRecord(payload["data"]);
+  const kind = readKind(eventName, payload["type"]);
+  if (
+    action === undefined ||
+    organizationId === undefined ||
+    data === undefined ||
+    kind === undefined
+  ) {
+    return undefined;
+  }
+  // A signed delivery timestamp proves freshness, but it is not a causal event timestamp: a
+  // comment can be created before the delivery is emitted. Prefer the comment's own timestamp
+  // so deferred history can exclude the trigger and all later comments. If neither entity nor
+  // event time is supplied, context materialization safely leaves history unavailable.
+  const occurredAt = firstDefined(
+    kind === "comment"
+      ? readDate(data[action === "create" ? "createdAt" : "updatedAt"])
+      : undefined,
+    readDate(payload["createdAt"]),
+  );
+  return {
+    kind,
+    action,
+    organizationId,
+    payload,
+    data,
+    ...(occurredAt === undefined ? {} : { occurredAt }),
+  };
+}
+
+function normalizeIssueEvent(
+  envelope: LinearEnvelope,
+  hydratedIssue: LinearIssueDetails | undefined,
+): NormalizedLinearEvent | undefined {
+  const issue = normalizeIssue(envelope.data, hydratedIssue);
+  if (issue === undefined) return undefined;
+  // Normalized null defaults are not evidence. Use an explicit, same-issue provider result
+  // only for this omitted relation; leave all other missing fields unknown.
+  const changeData =
+    hasOmittedAssigneeChange(envelope) &&
+    hydratedIssue?.id === readString(envelope.data["id"]) &&
+    hydratedIssue?.assigneeId === null
+      ? { ...envelope.data, assigneeId: null }
+      : envelope.data;
+  return NormalizedLinearIssueEventSchema.parse({
+    type: "issue",
+    action: envelope.action,
+    id: firstDefined(readString(envelope.data["id"]), issue.id),
+    organizationId: envelope.organizationId,
+    actor: normalizeActor(envelope.payload["actor"]),
+    issue,
+    updatedFrom: normalizePreviousIssue(envelope.payload["updatedFrom"]),
+    ...(envelope.action === "create" && readDate(envelope.data["updatedAt"]) !== undefined
+      ? {
+          sourceStateId: relatedId(envelope.data, "stateId", "state", null),
+          ...(readDate(envelope.data["updatedAt"]) === undefined
+            ? {}
+            : { sourceIssueUpdatedAt: readDate(envelope.data["updatedAt"]) }),
+        }
+      : {}),
+    ...(envelope.action === "create" && isBotActor(envelope.payload["actor"])
+      ? { sourceActorIsBot: true }
+      : {}),
+    changes: linearIssueChanges(changeData, envelope.payload["updatedFrom"]),
+    ...(envelope.occurredAt === undefined ? {} : { occurredAt: envelope.occurredAt }),
+  });
+}
+
+function normalizeCommentEvent(
+  envelope: LinearEnvelope,
+  hydratedIssue: LinearIssueDetails | undefined,
+): NormalizedLinearEvent | undefined {
+  const commentId = readString(envelope.data["id"]);
+  const issueId = firstDefined(
+    readString(envelope.data["issueId"]),
+    readString(asRecord(envelope.data["issue"])?.["id"]),
+  );
+  if (commentId === undefined || issueId === undefined) return undefined;
+  return NormalizedLinearCommentEventSchema.parse({
+    type: "comment",
+    action: envelope.action,
+    id: commentId,
+    organizationId: envelope.organizationId,
+    actor:
+      normalizeActor(envelope.payload["actor"]) ??
+      normalizeActor(envelope.data["user"]) ??
+      actorFromUserId(envelope.data) ??
+      null,
+    comment: {
+      id: commentId,
+      body: readString(envelope.data["body"]) ?? "",
+      issueId,
+      parentId: relatedId(envelope.data, "parentId", "parent", null),
+    },
+    issue: normalizeIssue(asRecord(envelope.data["issue"]) ?? {}, hydratedIssue) ?? null,
+    ...(envelope.occurredAt === undefined ? {} : { occurredAt: envelope.occurredAt }),
+  });
+}
+
+function normalizeAgentSessionEvent(
+  payload: Record<string, unknown>,
+  hydratedIssue: LinearIssueDetails | undefined,
+): NormalizedLinearEvent | undefined {
+  const envelope = readAgentSessionEnvelope(payload);
+  if (envelope === undefined) return undefined;
+  const { action, organizationId, session, sessionId, appUserId, issueId, status, issueData } =
+    envelope;
+  const issue = normalizeIssue(issueData, hydratedIssue) ?? null;
+  const promptContext = readString(payload["promptContext"]);
+  const turn = normalizeAgentSessionTurn({ action, payload, session, issue, promptContext });
+  if (turn === undefined) return undefined;
+  const url = readString(session["url"]);
+  const externalUrls = z
+    .array(z.object({ label: z.string(), url: z.string().url() }))
+    .safeParse(session["externalUrls"] ?? session["externalLinks"]);
+  const rootCommentId = firstDefined(
+    readString(asRecord(session["comment"])?.["id"]),
+    readString(session["commentId"]),
+  );
+  return NormalizedLinearAgentSessionEventSchema.parse({
+    type: "agent_session",
+    action,
+    id: turn.activity?.id ?? sessionId,
+    organizationId,
+    actor: turn.actor ?? null,
+    agentSession: {
+      id: sessionId,
+      appUserId,
+      ...(externalUrls.success ? { externalUrls: externalUrls.data } : {}),
+      issueId,
+      status,
+      ...(url === undefined ? {} : { url }),
+      ...(rootCommentId === undefined ? {} : { rootCommentId }),
+      ...(turn.sourceCommentId === undefined ? {} : { sourceCommentId: turn.sourceCommentId }),
+    },
+    agentActivity: turn.activity ?? null,
+    prompt: turn.prompt,
+    parserMessage: turn.parserMessage,
+    promptContext: promptContext ?? null,
+    issue,
+    occurredAt: turn.occurredAt,
+  });
+}
+
+function readAgentSessionEnvelope(payload: Record<string, unknown>):
+  | {
+      action: "created" | "prompted";
+      organizationId: string;
+      session: Record<string, unknown>;
+      sessionId: string;
+      appUserId: string;
+      issueId: string;
+      status: string;
+      issueData: Record<string, unknown>;
+    }
+  | undefined {
+  const action = readAgentSessionAction(payload["action"]);
+  const organizationId = readString(payload["organizationId"]);
+  const session = asRecord(payload["agentSession"]);
+  if (action === undefined || organizationId === undefined || session === undefined) {
+    return undefined;
+  }
+  const sessionId = readString(session["id"]);
+  const appUserId = firstDefined(
+    readString(payload["appUserId"]),
+    readString(session["appUserId"]),
+  );
+  const issueData = asRecord(session["issue"]) ?? {};
+  const issueId = firstDefined(readString(session["issueId"]), readString(issueData["id"]));
+  const status = readString(session["status"]);
+  if (
+    sessionId === undefined ||
+    appUserId === undefined ||
+    issueId === undefined ||
+    status === undefined
+  ) {
+    return undefined;
+  }
+  return { action, organizationId, session, sessionId, appUserId, issueId, status, issueData };
+}
+
+function normalizeAgentSessionTurn(input: {
+  action: "created" | "prompted";
+  payload: Record<string, unknown>;
+  session: Record<string, unknown>;
+  issue: NormalizedLinearIssue | null;
+  promptContext: string | undefined;
+}):
+  | {
+      activity: NormalizedPromptActivity | undefined;
+      actor: { id: string; name?: string } | undefined;
+      prompt: string;
+      parserMessage: string;
+      occurredAt: string;
+      sourceCommentId: string | undefined;
+    }
+  | undefined {
+  const activityData = asRecord(input.payload["agentActivity"]);
+  const promptActivity = normalizePromptActivity(activityData);
+  if (input.action === "prompted") {
+    if (promptActivity === undefined) return undefined;
+    const { activity } = promptActivity;
+    return {
+      activity,
+      actor: normalizeActor(activityData?.["user"]) ?? actorFromUserId(activityData ?? {}),
+      prompt: activity.body,
+      parserMessage: activity.body,
+      occurredAt: activity.createdAt,
+      // The session's own source comment opened it and was handled when the session was created;
+      // this turn comes from the comment Linear attached to the prompt activity, if any.
+      sourceCommentId: promptActivity.sourceCommentId,
+    };
+  }
+
+  const rootComment = asRecord(input.session["comment"]);
+  const directMessage = readString(rootComment?.["body"]);
+  const prompt = firstDefined(input.promptContext, directMessage, issuePrompt(input.issue));
+  const parserMessage = firstDefined(directMessage, prompt);
+  const occurredAt = firstDefined(
+    readDate(input.payload["createdAt"]),
+    readDate(input.session["createdAt"]),
+  );
+  if (prompt === undefined || parserMessage === undefined || occurredAt === undefined) {
+    return undefined;
+  }
+  return {
+    activity: promptActivity?.activity,
+    actor:
+      normalizeActor(input.payload["actor"]) ??
+      normalizeActor(input.session["creator"]) ??
+      actorFromId(input.session["creatorId"]) ??
+      actorFromId(rootComment?.["userId"]),
+    prompt,
+    parserMessage,
+    occurredAt,
+    sourceCommentId: firstDefined(
+      readString(asRecord(input.session["sourceComment"])?.["id"]),
+      readString(input.session["sourceCommentId"]),
+      readString(input.payload["sourceCommentId"]),
+    ),
+  };
+}
+
+interface NormalizedPromptActivity {
+  id: string;
+  type: "prompt";
+  body: string;
+  createdAt: string;
+  signal?: "stop";
+}
+
+/**
+ * The prompt activity, and the comment Linear attached to it when the prompt came from a reply
+ * in the session thread. The webhook may carry that comment as `sourceCommentId`, as a nested
+ * `sourceComment`, or inside the content; a prompt typed in the session panel has none.
+ */
+function normalizePromptActivity(
+  value: unknown,
+): { activity: NormalizedPromptActivity; sourceCommentId: string | undefined } | undefined {
+  const activity = asRecord(value);
+  const content = asRecord(activity?.["content"]);
+  if (activity === undefined || content?.["type"] !== "prompt") return undefined;
+  const id = readString(activity["id"]);
+  // Linear serializes the signal beside the content; older payloads nested it inside.
+  const signal = readStopSignal(activity["signal"]) ?? readStopSignal(content["signal"]);
+  // A stop prompt carries no user text, but the event still needs a non-empty prompt. The
+  // synthetic "Stop" body never reaches a run: the provider handles a `stop` signal before
+  // trigger matching and drops the event as `agent_session_stopped`.
+  const body = readString(content["body"]) ?? (signal === undefined ? undefined : "Stop");
+  const createdAt = readDate(activity["createdAt"]);
+  if (id === undefined || body === undefined || createdAt === undefined) return undefined;
+  return {
+    activity: { id, type: "prompt", body, createdAt, ...(signal === undefined ? {} : { signal }) },
+    sourceCommentId: firstDefined(
+      readString(activity["sourceCommentId"]),
+      readString(asRecord(activity["sourceComment"])?.["id"]),
+      readString(content["sourceCommentId"]),
+    ),
+  };
+}
+
+function readStopSignal(value: unknown): "stop" | undefined {
+  return value === "stop" ? "stop" : undefined;
+}
+
+function issuePrompt(issue: NormalizedLinearIssue | null): string | undefined {
+  if (issue === null) return undefined;
+  return issue.description === null || issue.description.length === 0
+    ? issue.title
+    : `${issue.title}\n\n${issue.description}`;
+}
+
+function normalizeIssue(
+  data: Record<string, unknown>,
+  hydrated: LinearIssueDetails | undefined,
+): NormalizedLinearIssue | undefined {
+  const id = firstDefined(readString(data["id"]), hydrated?.id);
+  if (id === undefined) return undefined;
+  const title = firstDefined(readString(data["title"]), hydrated?.title);
+  if (title === undefined) return undefined;
+  const identifier = firstDefined(readString(data["identifier"]), hydrated?.identifier);
+  const url = firstDefined(readString(data["url"]), hydrated?.url);
+  return {
+    id,
+    ...optionalProperty("identifier", identifier),
+    title,
+    description: nullableValue(data, "description", hydrated?.description ?? null),
+    ...optionalProperty("url", url),
+    ...normalizeIssueRelations(data, hydrated),
+    labelIds: firstDefined(readLabelIds(data), hydrated?.labelIds) ?? [],
+  };
+}
+
+function normalizeIssueRelations(
+  data: Record<string, unknown>,
+  hydrated: LinearIssueDetails | undefined,
+): Pick<NormalizedLinearIssue, "projectId" | "teamId" | "stateId" | "assigneeId" | "delegateId"> {
+  return {
+    projectId: relatedId(data, "projectId", "project", hydrated?.projectId ?? null),
+    teamId: relatedId(data, "teamId", "team", hydrated?.teamId ?? null),
+    stateId: relatedId(data, "stateId", "state", hydrated?.stateId ?? null),
+    assigneeId: relatedId(data, "assigneeId", "assignee", hydrated?.assigneeId ?? null),
+    delegateId: relatedId(data, "delegateId", "delegate", hydrated?.delegateId ?? null),
+  };
+}
+
+function actorFromUserId(data: Record<string, unknown>): { id: string } | undefined {
+  const id = readString(data["userId"]);
+  return id === undefined ? undefined : { id };
+}
+
+function actorFromId(value: unknown): { id: string } | undefined {
+  const id = readString(value);
+  return id === undefined ? undefined : { id };
+}
+
+function nullableValue(
+  data: Record<string, unknown>,
+  key: string,
+  fallback: string | null,
+): string | null {
+  const value = readNullableString(data[key]);
+  return value === undefined ? fallback : value;
+}
+
+function relatedId(
+  data: Record<string, unknown>,
+  directKey: string,
+  relationKey: string,
+  fallback: string | null,
+): string | null {
+  const direct = readNullableId(data, directKey);
+  if (direct !== undefined) return direct;
+  if (hasOwn(data, relationKey) && data[relationKey] === null) return null;
+  const nested = readNullableId(asRecord(data[relationKey]), "id");
+  return nested === undefined ? fallback : nested;
+}
+
+function optionalProperty(key: string, value: string | undefined): Record<string, string> {
+  return value === undefined ? {} : { [key]: value };
+}
+
+function firstDefined<T>(...values: readonly (T | undefined)[]): T | undefined {
+  return values.find((value) => value !== undefined);
+}
+
+function normalizePreviousIssue(value: unknown): z.infer<typeof LinearIssuePreviousSchema> {
+  const previous = asRecord(value);
+  if (previous === undefined) return {};
+  return {
+    ...(hasOwn(previous, "projectId") || hasOwn(previous, "project")
+      ? { projectId: readPreviousRelatedId(previous, "projectId", "project") }
+      : {}),
+    ...(hasOwn(previous, "teamId") || hasOwn(previous, "team")
+      ? { teamId: readPreviousRelatedId(previous, "teamId", "team") }
+      : {}),
+    ...(hasOwn(previous, "stateId") || hasOwn(previous, "state")
+      ? { stateId: readPreviousRelatedId(previous, "stateId", "state") }
+      : {}),
+    ...(hasOwn(previous, "assigneeId") || hasOwn(previous, "assignee")
+      ? { assigneeId: readPreviousRelatedId(previous, "assigneeId", "assignee") }
+      : {}),
+    ...(hasOwn(previous, "labelIds") || hasOwn(previous, "labels")
+      ? { labelIds: readLabelIds(previous) ?? [] }
+      : {}),
+  };
+}
+
+function readPreviousRelatedId(
+  previous: Record<string, unknown>,
+  directKey: string,
+  relationKey: string,
+): string | null | undefined {
+  return firstDefined(
+    readNullableId(previous, directKey),
+    previous[relationKey] === null ? null : readNullableId(asRecord(previous[relationKey]), "id"),
+  );
+}
+
+function isBotActor(value: unknown): boolean {
+  const actor = asRecord(value);
+  return (
+    actor?.["app"] === true ||
+    actor?.["isBot"] === true ||
+    actor?.["type"] === "application" ||
+    actor?.["type"] === "bot"
+  );
+}
+
+function normalizeActor(value: unknown): { id: string; name?: string } | null {
+  const actor = asRecord(value);
+  if (actor === undefined) return null;
+  const id = readString(actor["id"]);
+  if (id === undefined) return null;
+  const name = readString(actor["name"]) ?? readString(actor["displayName"]);
+  return name === undefined ? { id } : { id, name };
+}
+
+function readKind(
+  eventName: string | null | undefined,
+  type: unknown,
+): "issue" | "comment" | undefined {
+  const value = (eventName ?? (typeof type === "string" ? type : "")).toLowerCase();
+  if (value.includes("issue")) return "issue";
+  if (value.includes("comment")) return "comment";
+  return undefined;
+}
+
+function isAgentSessionEvent(
+  payload: unknown,
+  eventName: string | null | undefined,
+): payload is Record<string, unknown> {
+  if (!isRecord(payload)) return false;
+  const value = (eventName ?? readString(payload["type"]) ?? "").toLowerCase();
+  return value === "agentsessionevent" || value === "agent_session";
+}
+
+function readAction(value: unknown): "create" | "update" | "remove" | undefined {
+  return value === "create" || value === "update" || value === "remove" ? value : undefined;
+}
+
+function readAgentSessionAction(value: unknown): "created" | "prompted" | undefined {
+  return value === "created" || value === "prompted" ? value : undefined;
+}
+
+function readLabelIds(value: Record<string, unknown>): string[] | undefined {
+  const direct = value["labelIds"];
+  if (Array.isArray(direct) && direct.every((candidate) => typeof candidate === "string")) {
+    return direct;
+  }
+  const labels = value["labels"];
+  const nodes = Array.isArray(labels) ? labels : asRecord(labels)?.["nodes"];
+  if (!Array.isArray(nodes)) return undefined;
+  return nodes.flatMap((candidate) => {
+    const id = readString(asRecord(candidate)?.["id"]);
+    return id === undefined ? [] : [id];
+  });
+}
+
+function readNullableId(
+  value: Record<string, unknown> | undefined,
+  key: string,
+): string | null | undefined {
+  if (value === undefined || !hasOwn(value, key)) return undefined;
+  return readNullableString(value[key]);
+}
+
+function readNullableString(value: unknown): string | null | undefined {
+  return value === null || typeof value === "string" ? value : undefined;
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function readDate(value: unknown): string | undefined {
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value)))
+    return new Date(value).toISOString();
+  if (typeof value === "number" && Number.isFinite(value)) return new Date(value).toISOString();
+  return undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}

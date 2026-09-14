@@ -23,6 +23,7 @@ import {
   createDaemonModule,
   enrollDaemon,
   revokeDaemon,
+  updateDaemonPermissions,
   type DaemonClock,
   type DaemonModule,
 } from "./daemons/index.js";
@@ -31,7 +32,11 @@ import type {
   DaemonDispatchLifecycleOptions,
   ExecutionDeadlineClock,
 } from "./daemons/lifecycle.js";
-import type { TriggerProviderFactory, TriggerProviderResources } from "./providers/registration.js";
+import type {
+  TriggerProviderExecutionControl,
+  TriggerProviderFactory,
+  TriggerProviderResources,
+} from "./providers/registration.js";
 import type { TriggerProvider, TriggerSource } from "./triggers/index.js";
 import {
   createManualTriggerSource,
@@ -39,6 +44,7 @@ import {
   handleManualTriggerRequest,
 } from "./triggers/manual/source.js";
 import { createManualRunProvider } from "./triggers/manual/provider.js";
+import { OrganizationTriggerStore } from "./triggers/store.js";
 import { DaemonRegistration } from "./daemons/registration.js";
 import { CliAuthorizations } from "./cli-authorizations/index.js";
 import type { BrowserOrganizationAccess } from "./auth/browser-organization-access.js";
@@ -83,6 +89,7 @@ export interface HubRuntime {
 export interface HubOperations {
   handleDaemonEnrollment(request: Request): Promise<Response>;
   handleDaemonRevocation(request: Request, daemonId: string): Promise<Response>;
+  handleDaemonPermissionUpdate(request: Request, daemonId: string): Promise<Response>;
   handleCliAuthorizationStart(request: Request): Promise<Response>;
   handleCliAuthorizationPoll(request: Request): Promise<Response>;
   handleCliAuthorizationInspect(request: Request): Promise<Response>;
@@ -122,6 +129,9 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
   const manualProvider =
     options.database === null ? undefined : createManualRunProvider(storeForProject);
   const attachments = createAttachmentRegistry(options);
+  // Providers are created before the daemon module that depends on them, so execution control
+  // binds to the module lazily; it is only ever invoked while handling live events.
+  let executionDaemonModule: DaemonModule | null | undefined;
   const configuredProviders =
     options.database === null
       ? []
@@ -134,6 +144,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
                 throw new Error("no connection resolver registered");
               }),
             ...(attachments === undefined ? {} : { attachments }),
+            executions: executionControlFor(() => executionDaemonModule),
           }),
         );
   const providers = [manualProvider, ...configuredProviders, ...(options.providers ?? [])].filter(
@@ -141,6 +152,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
   );
   const outputRegistry = options.outputRegistry ?? new OutputExecutorRegistry();
   const daemonModule = createAppDaemonModule(options, daemons, providers, outputRegistry);
+  executionDaemonModule = daemonModule;
   const capabilityServer = createAppExecutionCapabilityServer(
     options,
     daemonModule,
@@ -197,7 +209,10 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       ? {}
       : {
           onWorkflowDeadlineExceeded: async (recovery: WorkflowDeadlineRecovery) => {
-            await daemonModule.lifecycle.recoverWorkflowDeadlineExecutions(recovery.executionIds);
+            await daemonModule.lifecycle.recoverWorkflowDeadlineExecutions(
+              recovery.executionIds,
+              recovery.completedExecutionIds ?? [],
+            );
           },
           onWorkflowRunAccepted: (run: AcceptedTriggerRunRecord) =>
             daemonModule.lifecycle.notifyWorkflowRunAccepted(run),
@@ -260,6 +275,10 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       options.database === null || daemons === null
         ? databaseUnavailable()
         : revokeDaemon(request, daemonId, options.database, daemons),
+    handleDaemonPermissionUpdate: (request, daemonId) =>
+      options.database === null || daemons === null
+        ? databaseUnavailable()
+        : updateDaemonPermissions(request, daemonId, options.database, daemons),
     handleCliAuthorizationStart: (request) =>
       cliAuthorizations === null ? databaseUnavailable() : cliAuthorizations.start(request),
     handleCliAuthorizationPoll: (request) =>
@@ -301,6 +320,49 @@ function createAppPublicOperations(
   return createPublicOperations(
     createDatabasePublicOperationRepository(database),
     {
+      triggerForOrganization: (organizationId) => {
+        const store = new OrganizationTriggerStore(database, organizationId);
+        return {
+          async list() {
+            return Promise.all(
+              (await store.list()).map(async (trigger) => ({
+                id: trigger.id,
+                name: trigger.name,
+                enabled: trigger.enabled,
+                format: trigger.format,
+                yaml: (await store.activeRevision(trigger)).yaml,
+              })),
+            );
+          },
+          async validate(yaml) {
+            const prepared = await store.validate(yaml);
+            return { name: prepared.compiled.authored.name };
+          },
+          async install(input) {
+            const prepared = await store.validate(input.yaml);
+            const existing = (await store.list()).find(
+              ({ name }) => name === prepared.compiled.authored.name,
+            );
+            const trigger = await store.save({
+              ...(existing === undefined ? {} : { triggerId: existing.id }),
+              yaml: input.yaml,
+              userId: null,
+              sourceEvidence: {
+                kind: input.credentialKind === "apiKey" ? "api-key" : "cli-credential",
+                credentialId: input.credentialId,
+                authoredFormat: "self_contained_trigger_v1",
+              },
+            });
+            const revision = await store.activeRevision(trigger);
+            return {
+              triggerId: trigger.id,
+              name: trigger.name,
+              revisionId: revision.id,
+              version: revision.version,
+            };
+          },
+        };
+      },
       configurationForProject,
       validateBundleForOrganization: (organizationId, files) =>
         validateHubBundleForOrganization(
@@ -364,6 +426,28 @@ function connectDaemonLifecycle(
       "daemon_revoked",
     ),
   );
+}
+
+function executionControlFor(
+  daemonModule: () => DaemonModule | null | undefined,
+): TriggerProviderExecutionControl {
+  return {
+    stopActive: async (input) => {
+      const current = daemonModule()?.lifecycle;
+      if (current === undefined) {
+        throw new Error("execution control is unavailable before the daemon module");
+      }
+      const stopped = await current.stopAgentExecutions(input);
+      return { stopped: stopped.executions.length + stopped.runs.length };
+    },
+    promptActive: async (input) => {
+      const current = daemonModule()?.lifecycle;
+      if (current === undefined) {
+        throw new Error("execution control is unavailable before the daemon module");
+      }
+      return current.promptAgentExecutions(input);
+    },
+  };
 }
 
 function createAppDaemonModule(

@@ -27,17 +27,29 @@ const slackStatusSchema = z.discriminatedUnion("status", [
     status: z.literal("connected"),
   }),
 ]);
+const linearStatusSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("notConfigured") }),
+  z.object({ status: z.literal("disconnected") }),
+  z.object({ status: z.literal("requiresReauthorization") }),
+  z.object({ status: z.literal("connected") }),
+]);
 export const connectionStatusSchema = z.object({
   canManage: z.boolean(),
   github: githubStatusSchema,
   discord: discordStatusSchema,
   slack: slackStatusSchema,
+  linear: linearStatusSchema,
 });
 const scopeSchema = z.object({
   organizationSlug: z.string().min(1),
   projectSlug: z.string().min(1).optional(),
 });
-const providerSchema = scopeSchema.extend({ provider: z.enum(["github", "discord", "slack"]) });
+const providerSchema = scopeSchema.extend({
+  provider: z.enum(["github", "discord", "slack", "linear"]),
+});
+const startConnectionSchema = providerSchema.extend({
+  linearAgentSessions: z.boolean().optional(),
+});
 const disconnectSchema = providerSchema.extend({ connectionId: z.string().uuid() });
 const startSchema = z.object({ url: z.string().url() });
 
@@ -70,7 +82,7 @@ export const connectionStatus = createServerFn({ method: "GET" })
   });
 
 export const startConnection = createServerFn({ method: "POST" })
-  .validator(providerSchema)
+  .validator(startConnectionSchema)
   .handler(async ({ data }): Promise<Result<{ url: string }>> => {
     const name = providerName(data.provider);
     try {
@@ -141,11 +153,13 @@ const CONNECTION_OPERATIONS = {
   github: { start: "githubStart", disconnect: "githubDisconnect" },
   discord: { start: "discordStart", disconnect: "discordDisconnect" },
   slack: { start: "slackStart", disconnect: "slackDisconnect" },
+  linear: { start: "linearStart", disconnect: "linearDisconnect" },
 } as const;
 
 function providerName(provider: ConnectionProvider): string {
   if (provider === "github") return "GitHub";
-  return provider === "discord" ? "Discord" : "Slack";
+  if (provider === "discord") return "Discord";
+  return provider === "slack" ? "Slack" : "Linear";
 }
 
 function connectionContext(
@@ -193,7 +207,11 @@ function connectionResponseFailure(
 function operationRequest(
   method: "GET" | "POST",
   path: string,
-  scope: { organizationSlug: string; projectSlug?: string | undefined },
+  scope: {
+    organizationSlug: string;
+    projectSlug?: string | undefined;
+    linearAgentSessions?: boolean | undefined;
+  },
   connectionId?: string,
 ): Request {
   const incoming = getRequest();
@@ -202,6 +220,9 @@ function operationRequest(
   const url = new URL(path, incoming.url);
   url.searchParams.set("organizationSlug", scope.organizationSlug);
   if (scope.projectSlug !== undefined) url.searchParams.set("projectSlug", scope.projectSlug);
+  if (scope.linearAgentSessions === true) {
+    url.searchParams.set("linearAgentSessions", "true");
+  }
   if (connectionId !== undefined) url.searchParams.set("connectionId", connectionId);
   return new Request(url, {
     method,

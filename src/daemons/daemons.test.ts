@@ -54,6 +54,47 @@ describe("daemon enrollment and execution", () => {
     );
   });
 
+  it("keeps a connected-only daemon online without execution permission", async () => {
+    const daemonId = await hub.connectDaemon(undefined, []);
+    const daemon = await hub.daemon(daemonId);
+
+    assert.deepEqual(
+      {
+        permissions: daemon.permissions,
+        presence: daemon.presence,
+        connected: daemon.connectedAt !== null,
+      },
+      { permissions: [], presence: "connected", connected: true },
+    );
+  });
+
+  it("lets the authenticated daemon update semantic permissions without reconnecting", async () => {
+    const daemonId = await hub.connectDaemon(undefined, []);
+
+    assert.equal(await hub.updateConnectedDaemonPermissions(["hub.execute"]), 200);
+    assert.deepEqual((await hub.daemon(daemonId)).permissions, ["hub.execute"]);
+
+    assert.equal(await hub.updateConnectedDaemonPermissions([]), 200);
+    assert.deepEqual((await hub.daemon(daemonId)).permissions, []);
+  });
+
+  it("rejects permission changes that do not carry the daemon credential", async () => {
+    const daemonId = await hub.connectDaemon(undefined, []);
+
+    assert.equal(
+      await hub.updateConnectedDaemonPermissions(["hub.execute"], "wrong-credential"),
+      401,
+    );
+    assert.deepEqual((await hub.daemon(daemonId)).permissions, []);
+  });
+
+  it("maps a legacy enrollment scope to hub.execute at the compatibility boundary", async () => {
+    const enrollment = await hub.enrollLegacyDaemon();
+
+    assert.deepEqual(enrollment.scopes, ["hub.execution.*"]);
+    assert.deepEqual((await hub.daemon(enrollment.daemonId)).permissions, ["hub.execute"]);
+  });
+
   it("replays one enrollment ceremony with a stable daemon", async () => {
     const enrollment = await hub.connectWithEnrollmentReplay();
 
@@ -339,7 +380,7 @@ describe("daemon enrollment and execution", () => {
     assert.equal(classifierLaunch.cwd, "/workspace/hub");
     assert.equal(
       classifierLaunch.prompt,
-      "Choose one configured repository environment and one complete named agent configuration.\n\ninvestigate the routing failure",
+      "Choose one configured repository environment and one complete named agent configuration.\n\n<@UBOT> investigate the routing failure",
     );
     assert.deepEqual(
       (await hub.listExecutionTools(classifier.id)).map(({ name }) => name),
@@ -366,7 +407,7 @@ describe("daemon enrollment and execution", () => {
     const workerLaunch = hub.createdAgentLaunch();
     assert.equal(workerLaunch.provider, "codex");
     assert.equal(workerLaunch.cwd, "/workspace/paseo");
-    assert.equal(workerLaunch.prompt, "investigate the routing failure");
+    assert.equal(workerLaunch.prompt, "<@UBOT> investigate the routing failure");
     assert.equal(workerLaunch.thinkingOptionId, "xhigh");
     assert.deepEqual(workerLaunch.providerOptions, {
       sandbox_workspace_write: {
@@ -493,7 +534,6 @@ describe("daemon enrollment and execution", () => {
     assert.equal(launchEnv["GIT_CONFIG_COUNT"], "5");
     assert.deepEqual(hub.authorityMintInputs(), [
       {
-        executionId: handedOff.execution.id,
         projectId: "00000000-0000-4000-8000-000000000001",
         connectionSlug: "getpaseo-github",
         repositories: ["getpaseo/paseo"],
@@ -625,6 +665,39 @@ describe("daemon enrollment and execution", () => {
     });
     assert.equal(hub.launchMaterializationCount(), 1);
   });
+
+  it.each([undefined, "", "   "])(
+    "rejects a persisted unbound Linear workspace before reconnect creates an agent (key %j)",
+    async (workspaceKey) => {
+      const daemonId = await hub.connectDaemon();
+      await hub.installConfiguration({ yaml: hub.manualConfigurationYaml() });
+      const persisted = await hub.persistUnlaunchedBatch(["legacy-linear"], 1, {
+        environment: {
+          kind: "daemon",
+          daemonId,
+          authoredSlug: hub.connectedDaemonSlug(),
+          cwd: "/workspace",
+          worktree: {
+            mode: "branch-off",
+            newBranch: "sen-136",
+            reuseWorkspace: true,
+            ...(workspaceKey === undefined ? {} : { workspaceKey }),
+          },
+        },
+        triggerContext: { provider: "linear" },
+      });
+      const execution = persisted.executions[0];
+      assert.ok(execution);
+
+      await hub.restartApp();
+      const recovered = await hub.waitForExecutionStatus(execution.id, "failed");
+
+      assert.equal(hub.createdAgentRequestCount(), 0);
+      assert.equal(hub.launchMaterializationCount(), 0);
+      assert.match(JSON.stringify(recovered.result), /linear_workspace_identity_missing/u);
+      assert.deepEqual(recovered.launchIntent, execution.launchIntent);
+    },
+  );
 
   it("does not materialize a stale recovery candidate after it becomes terminal", async () => {
     await hub.connectDaemon();
@@ -934,7 +1007,8 @@ describe("daemon enrollment and execution", () => {
     await hub.restartApp();
     await dispatch;
 
-    const recovered = await hub.waitForRecoveredExecution(pending.id);
+    await hub.waitForRecoveredExecution(pending.id);
+    const recovered = await hub.waitForExecutionStatus(pending.id, "running");
     assert.deepEqual(
       {
         status: recovered.status,
@@ -1254,8 +1328,7 @@ describe("daemon enrollment and execution", () => {
 
     await assert.rejects(
       hub.dispatch(),
-      (error: unknown) =>
-        error instanceof DaemonDispatchFailure && error.reason === "daemon_unreachable",
+      (error: unknown) => error instanceof DaemonDispatchFailure && error.reason === "internal",
     );
 
     const execution = await hub.acceptanceExecution();
@@ -1263,7 +1336,7 @@ describe("daemon enrollment and execution", () => {
       { status: execution.status, result: execution.result },
       {
         status: "failed",
-        result: { status: "failed", reason: "daemon_unreachable" },
+        result: { status: "failed", reason: "internal" },
       },
     );
     await hub.drainWorkflowOutbox();
@@ -1673,14 +1746,25 @@ describe("daemon enrollment and execution", () => {
       });
       assert.equal(result.status, 200);
       assert.ok(result.triggerRunId);
+      const execution = await hub.waitForExecutionForTriggerRun(result.triggerRunId);
+      await hub.waitForExecutionStatus(execution.id, "running");
       await hub.restartApp();
+      await hub.waitForRecoveredExecution(execution.id);
+      assert.deepEqual(
+        await hub.runtimeResources({
+          recoveredExecutionSubscriptions: 1,
+        }),
+        {
+          recoveredExecutionSubscriptions: 1,
+        },
+      );
+      assert.equal(await hub.completeExecution(execution.id), 200);
+      await hub.waitForExecutionStatus(execution.id, "succeeded");
       assert.deepEqual(
         await hub.runtimeResources({
           recoveredExecutionSubscriptions: 0,
         }),
-        {
-          recoveredExecutionSubscriptions: 0,
-        },
+        { recoveredExecutionSubscriptions: 0 },
       );
     }
 
@@ -1688,7 +1772,12 @@ describe("daemon enrollment and execution", () => {
       deliveryKey: "resource-runtime-stop",
     });
     assert.equal(stopped.status, 200);
+    assert.ok(stopped.triggerRunId);
+    const execution = await hub.waitForExecutionForTriggerRun(stopped.triggerRunId);
+    await hub.waitForExecutionStatus(execution.id, "running");
     await hub.restartApp();
+    await hub.waitForRecoveredExecution(execution.id);
+    await hub.runtimeResources({ recoveredExecutionSubscriptions: 1 });
     assert.deepEqual(await hub.stopRuntimeResources(), {
       recoveredExecutionSubscriptions: 0,
     });

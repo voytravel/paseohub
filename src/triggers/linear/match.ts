@@ -1,0 +1,438 @@
+import type {
+  CompiledTriggerConfig as CompiledTrigger,
+  TriggerFilter,
+} from "../../config/index.js";
+import type {
+  NormalizedLinearAgentSessionEvent,
+  NormalizedLinearCommentEvent,
+  NormalizedLinearEvent,
+  NormalizedLinearIssue,
+  NormalizedLinearIssueEvent,
+} from "./events.js";
+
+type MatchedTriggerDefinition = Pick<CompiledTrigger, "name" | "on" | "filters">;
+
+export interface MatchedLinearTrigger {
+  event: NormalizedLinearEvent;
+  trigger: MatchedTriggerDefinition;
+}
+
+/**
+ * Preserve a comment as the prompt while handing its input parser the text after its command
+ * marker. A command `pattern` is consumed only at a boundary; a `contains` marker is then found
+ * in the remaining tail. Input-shaped markers such as `repo=hub` remain in the parser text.
+ */
+export function readLinearCommentInvocationParserMessage(
+  event: NormalizedLinearCommentEvent,
+  filter: TriggerFilter | undefined,
+): string {
+  return readLinearInvocationParserMessage(event.comment.body, filter);
+}
+
+export function readLinearAgentSessionInvocationParserMessage(
+  event: NormalizedLinearAgentSessionEvent,
+  filter: TriggerFilter | undefined,
+): string {
+  return readLinearInvocationParserMessage(event.parserMessage, filter);
+}
+
+function readLinearInvocationParserMessage(
+  body: string,
+  filter: TriggerFilter | undefined,
+): string {
+  const pattern = readCommentTextFilter(filter, "pattern");
+  const contains = readCommentTextFilter(filter, "contains");
+
+  const consumedPatternEnd = consumeLeadingLinearCommandMarker(body, pattern);
+  if (pattern !== undefined && !pattern.includes("=") && consumedPatternEnd === undefined) {
+    return body;
+  }
+  if (consumedPatternEnd !== undefined) {
+    const overlappingContainsEnd = findOverlappingContainsEnd(body, contains, consumedPatternEnd);
+    if (overlappingContainsEnd !== undefined) {
+      return contains!.includes("=")
+        ? body.slice(skipLeadingWhitespace(body, consumedPatternEnd))
+        : body.slice(overlappingContainsEnd).trimStart();
+    }
+
+    const parserStart = skipLeadingWhitespace(body, consumedPatternEnd);
+    const containsIndex = findBoundaryDelimitedMarker(body, contains, parserStart);
+    return containsIndex === undefined
+      ? body.slice(parserStart)
+      : parserMessageAfterContains(body, containsIndex, contains!);
+  }
+
+  const containsIndex = findBoundaryDelimitedMarker(body, contains);
+  if (containsIndex === undefined) return body;
+
+  const parserMessage = parserMessageAfterContains(body, containsIndex, contains!);
+  return isLeadingInputShapedPattern(body, pattern) && containsIndex > 0
+    ? `${pattern} ${parserMessage}`
+    : parserMessage;
+}
+
+/**
+ * Match Linear's entity-level webhooks onto the small set of workflow-facing events. A scope
+ * transition is edge-triggered: an eligible issue creates one run when it enters scope rather
+ * than another run for every later title, estimate, or description update.
+ *
+ * `appUserId` is the Linear user the connection acts as; only `thread_with_app` consults it.
+ */
+export function matchLinearTriggers(
+  config: { triggers: readonly MatchedTriggerDefinition[] },
+  event: NormalizedLinearEvent,
+  connectionId?: string | null,
+  appUserId?: string | null,
+): MatchedLinearTrigger[] {
+  const matches = config.triggers.flatMap((trigger) => {
+    if (!matchesLinearEvent(trigger.on, event)) return [];
+    if (!matchesTriggerFilter(trigger, event, connectionId, appUserId)) return [];
+    return [{ event, trigger }];
+  });
+  // A delegated comment has a native session owner. Do not also run its legacy comment rule.
+  return matches.some((match) => match.trigger.on === "linear.delegated_comment")
+    ? matches.filter((match) => match.trigger.on === "linear.delegated_comment")
+    : matches;
+}
+
+export function matchesIssueScope(
+  issue: NormalizedLinearIssue,
+  filter: TriggerFilter | undefined,
+  connectionId?: string | null,
+): boolean {
+  if (filter === undefined) return false;
+  if (filter.connectionId !== undefined && filter.connectionId !== connectionId) return false;
+  if (filter.project !== undefined && filter.project !== issue.projectId) return false;
+  if (filter.team !== undefined && filter.team !== issue.teamId) return false;
+  if (filter.states !== undefined && !matchesOptionalId(filter.states, issue.stateId)) return false;
+  if (filter.assignees !== undefined && !matchesOptionalId(filter.assignees, issue.assigneeId)) {
+    return false;
+  }
+  if (
+    filter.labels !== undefined &&
+    !filter.labels.every((label) => issue.labelIds.includes(label))
+  ) {
+    return false;
+  }
+  if (
+    filter.exclude_labels !== undefined &&
+    filter.exclude_labels.some((label) => issue.labelIds.includes(label))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): boolean {
+  if (eventName === "linear.delegated_issue_updated") {
+    return (
+      event.type === "issue" &&
+      event.action === "update" &&
+      (event.changes ?? []).some(({ field }) => field !== "delegateId")
+    );
+  }
+  if (eventName === "linear.issue_entered_scope") {
+    return event.type === "issue" && (event.action === "create" || event.action === "update");
+  }
+  if (eventName === "linear.issue_assigned") {
+    return (
+      event.type === "issue" &&
+      event.action === "update" &&
+      event.issue.assigneeId !== null &&
+      Object.hasOwn(event.updatedFrom, "assigneeId")
+    );
+  }
+  if (eventName === "linear.agent_session") return event.type === "agent_session";
+  return (
+    (eventName === "linear.comment_created" || eventName === "linear.delegated_comment") &&
+    event.type === "comment" &&
+    event.action === "create"
+  );
+}
+
+function matchesTriggerFilter(
+  trigger: MatchedTriggerDefinition,
+  event: NormalizedLinearEvent,
+  connectionId?: string | null,
+  appUserId?: string | null,
+): boolean {
+  if (trigger.on === "linear.issue_entered_scope") {
+    return (
+      event.type === "issue" &&
+      enteredConfiguredScope(event, trigger.filters, connectionId) &&
+      matchesActorIfPresent(event, trigger.filters?.from_users, appUserId)
+    );
+  }
+  const issue = event.type === "issue" ? event.issue : event.issue;
+  if (issue === null || !matchesLinearWorkAuthority(trigger, event, issue, connectionId, appUserId))
+    return false;
+  if (
+    trigger.on === "linear.delegated_comment" &&
+    !matchesDelegatedComment(event, issue, appUserId)
+  )
+    return false;
+  if (event.type === "comment" && !matchesComment(event, trigger.filters, appUserId)) {
+    return false;
+  }
+  if (event.type === "agent_session" && !matchesText(event.parserMessage, trigger.filters)) {
+    return false;
+  }
+  return true;
+}
+
+type LinearAuthorityEvent = Pick<NormalizedLinearEvent, "type" | "action" | "actor">;
+
+/** The same work authority is checked at admission and after a queued event waits. */
+export function matchesLinearWorkAuthority(
+  trigger: MatchedTriggerDefinition,
+  event: LinearAuthorityEvent,
+  issue: NormalizedLinearIssue,
+  connectionId?: string | null,
+  appUserId?: string | null,
+): boolean {
+  if (!matchesIssueScope(issue, trigger.filters, connectionId)) return false;
+  if (!matchesRequiredDelegate(trigger, event, issue, appUserId)) return false;
+  // Assignment rules may have no actor. Team/label/assignee scope still applies, and an
+  // actor that is present must satisfy from_users, as at the original admission boundary.
+  return trigger.on === "linear.issue_assigned"
+    ? matchesActorIfPresent(event, trigger.filters?.from_users, appUserId)
+    : matchesActor(event, trigger.filters?.from_users, appUserId) ||
+        matchesAutomatedSession(event, trigger.filters);
+}
+
+function matchesRequiredDelegate(
+  trigger: MatchedTriggerDefinition,
+  event: LinearAuthorityEvent,
+  issue: NormalizedLinearIssue,
+  appUserId: string | null | undefined,
+): boolean {
+  if (event.type === "agent_session") return true;
+  if (trigger.on !== "linear.delegated_issue_updated" && trigger.filters?.require_delegate !== true)
+    return true;
+  return appUserId != null && issue.delegateId === appUserId && event.actor?.id !== appUserId;
+}
+
+function matchesDelegatedComment(
+  event: NormalizedLinearEvent,
+  issue: NormalizedLinearIssue,
+  appUserId: string | null | undefined,
+): boolean {
+  if (
+    event.type !== "comment" ||
+    typeof appUserId !== "string" ||
+    event.actor === null ||
+    event.actor.id === appUserId ||
+    (event.comment.parentId !== null && event.threadIsAgentSession !== false)
+  )
+    return false;
+  // If the comment explicitly targets another user or agent (e.g. @jarvis) and does not mention this app, do not intercept
+  const body = event.comment.body.toLowerCase();
+  const mentionsThisApp = body.includes("@pagent") || body.includes("@p agent") || body.includes(appUserId.toLowerCase());
+  if (!mentionsThisApp) {
+    if (issue.delegateId !== appUserId) return false;
+    const hasOtherMention = /@[a-z0-9_-]+/i.test(event.comment.body) || /\[@[^\]]+\]\([^)]+\)/i.test(event.comment.body) || /<user id="[^"]+"/i.test(event.comment.body);
+    if (hasOtherMention) return false;
+  }
+  return true;
+}
+
+/** The filter-specific edge check, separated to keep the generic event selection readable. */
+function enteredConfiguredScope(
+  event: NormalizedLinearIssueEvent,
+  filter: TriggerFilter | undefined,
+  connectionId?: string | null,
+): boolean {
+  if (!matchesIssueScope(event.issue, filter, connectionId)) return false;
+  if (event.action === "create") return true;
+  if (event.action !== "update") return false;
+  const before: NormalizedLinearIssue = {
+    ...event.issue,
+    ...(Object.hasOwn(event.updatedFrom, "projectId")
+      ? { projectId: event.updatedFrom.projectId ?? null }
+      : {}),
+    ...(Object.hasOwn(event.updatedFrom, "teamId")
+      ? { teamId: event.updatedFrom.teamId ?? null }
+      : {}),
+    ...(Object.hasOwn(event.updatedFrom, "stateId")
+      ? { stateId: event.updatedFrom.stateId ?? null }
+      : {}),
+    ...(Object.hasOwn(event.updatedFrom, "assigneeId")
+      ? { assigneeId: event.updatedFrom.assigneeId ?? null }
+      : {}),
+    ...(Object.hasOwn(event.updatedFrom, "labelIds")
+      ? { labelIds: event.updatedFrom.labelIds ?? [] }
+      : {}),
+  };
+  return !matchesIssueScope(before, filter, connectionId);
+}
+
+function matchesActorIfPresent(
+  event: LinearAuthorityEvent,
+  allowed: readonly string[] | undefined,
+  appUserId?: string | null,
+): boolean {
+  return allowed === undefined || allowed.length === 0 || matchesActor(event, allowed, appUserId);
+}
+
+/** Issue scope is checked first; automation never borrows a human's identity. */
+function matchesAutomatedSession(
+  event: LinearAuthorityEvent,
+  filter: TriggerFilter | undefined,
+): boolean {
+  return (
+    event.type === "agent_session" &&
+    event.action === "created" &&
+    event.actor === null &&
+    filter?.allow_automated_sessions === true &&
+    (filter.from_users?.length ?? 0) > 0 &&
+    filter.team !== undefined &&
+    filter.connectionId !== undefined
+  );
+}
+
+/**
+ * Who may start an agent, `*` meaning everyone with access to the workspace.
+ *
+ * The wildcard already exists for GitHub triggers; Linear only ever matched explicit ids, so a
+ * team could not simply let its members ask the agent for something without naming each of them.
+ *
+ * It never covers the app itself. The agent's own comments are events like any other, and a
+ * comment trigger that accepted them would answer its own answer, forever. An explicit list makes
+ * that mistake visible; a wildcard would hide it, so the exclusion is enforced here rather than
+ * left to whoever writes the bundle.
+ */
+function matchesActor(
+  event: LinearAuthorityEvent,
+  allowed: readonly string[] | undefined,
+  appUserId?: string | null,
+): boolean {
+  if (allowed === undefined || allowed.length === 0) return false;
+  if (event.actor === null) {
+    return event.type === "agent_session" && event.action === "created" && allowed.includes("*");
+  }
+  if (allowed.includes(event.actor.id)) return true;
+  if (!allowed.includes("*")) return false;
+  return typeof appUserId !== "string" || event.actor.id !== appUserId;
+}
+
+function matchesOptionalId(allowed: readonly string[], value: string | null): boolean {
+  return value !== null && allowed.includes(value);
+}
+
+function matchesComment(
+  event: NormalizedLinearCommentEvent,
+  filter: TriggerFilter | undefined,
+  appUserId: string | null | undefined,
+): boolean {
+  if (filter?.replies_only === true && event.comment.parentId === null) return false;
+  if (filter?.thread_with_app === true && !isReplyInThreadWithApp(event, appUserId)) return false;
+  return matchesText(event.comment.body, filter);
+}
+
+/**
+ * A reply in a plain comment thread the app already commented in. A root comment never
+ * qualifies, and an unread thread (`threadAuthorIds` absent) or an unknown app user fails
+ * closed: firing on a guess would bring back the double runs this filter exists to avoid.
+ *
+ * An agent-session thread never qualifies either, even though the app's responses make it
+ * look like one: Linear delivers a reply there as a session prompt as well, and the session
+ * is the one handling it. `replies_only` on its own is not affected.
+ */
+function isReplyInThreadWithApp(
+  event: NormalizedLinearCommentEvent,
+  appUserId: string | null | undefined,
+): boolean {
+  return (
+    event.comment.parentId !== null &&
+    event.threadIsAgentSession !== true &&
+    typeof appUserId === "string" &&
+    event.threadAuthorIds !== undefined &&
+    event.threadAuthorIds.includes(appUserId)
+  );
+}
+
+function matchesText(body: string, filter: TriggerFilter | undefined): boolean {
+  const pattern = filter?.pattern;
+  if (pattern !== undefined && !body.startsWith(pattern)) return false;
+  const contains = filter?.contains;
+  return contains === undefined || body.includes(contains);
+}
+
+function consumeLeadingLinearCommandMarker(
+  message: string,
+  marker: string | undefined,
+): number | undefined {
+  if (marker === undefined || marker.includes("=") || !message.startsWith(marker)) {
+    return undefined;
+  }
+  return hasTrailingMarkerBoundary(message, marker.length) ? marker.length : undefined;
+}
+
+function findOverlappingContainsEnd(
+  message: string,
+  marker: string | undefined,
+  consumedPatternEnd: number,
+): number | undefined {
+  const markerIndex = findBoundaryDelimitedMarker(message, marker);
+  if (markerIndex === undefined || markerIndex >= consumedPatternEnd) return undefined;
+  return Math.max(consumedPatternEnd, markerIndex + marker!.length);
+}
+
+function parserMessageAfterContains(message: string, markerIndex: number, marker: string): string {
+  return marker.includes("=")
+    ? message.slice(markerIndex)
+    : message.slice(markerIndex + marker.length).trimStart();
+}
+
+function isLeadingInputShapedPattern(
+  message: string,
+  marker: string | undefined,
+): marker is string {
+  return (
+    marker !== undefined &&
+    marker.includes("=") &&
+    message.startsWith(marker) &&
+    hasTrailingMarkerBoundary(message, marker.length)
+  );
+}
+
+function findBoundaryDelimitedMarker(
+  message: string,
+  marker: string | undefined,
+  from = 0,
+): number | undefined {
+  if (marker === undefined) return undefined;
+  let start = from;
+  while (start < message.length) {
+    const index = message.indexOf(marker, start);
+    if (index === -1) return undefined;
+    const before = message.at(index - 1);
+    if (
+      (index === 0 || (before !== undefined && /\s/u.test(before))) &&
+      hasTrailingMarkerBoundary(message, index + marker.length)
+    ) {
+      return index;
+    }
+    start = index + marker.length;
+  }
+  return undefined;
+}
+
+function hasTrailingMarkerBoundary(message: string, end: number): boolean {
+  const after = message.at(end);
+  return after === undefined || /\s/u.test(after);
+}
+
+function skipLeadingWhitespace(message: string, from: number): number {
+  let start = from;
+  while (start < message.length && /\s/u.test(message[start]!)) start += 1;
+  return start;
+}
+
+function readCommentTextFilter(
+  filter: TriggerFilter | undefined,
+  key: "pattern" | "contains",
+): string | undefined {
+  const value = filter?.[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}

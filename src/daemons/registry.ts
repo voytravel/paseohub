@@ -14,9 +14,15 @@ import {
   HubExecutionAgentValidateResponseSchema,
   HubExecutionAgentStreamSchema,
   HubExecutionAgentUpdateSchema,
+  HubExecutionAgentPromptRequestSchema,
+  HubExecutionAgentPromptResponseSchema,
   HubExecutionControlRequestSchema,
   HubExecutionControlResponseSchema,
   HubExecutionOutboundSchema,
+  HubDaemonHelloSchema,
+  HubDaemonServerInfoEnvelopeSchema,
+  DaemonAgentMessageRequestSchema,
+  DaemonAgentMessageResponseSchema,
 } from "../hub/protocol.js";
 import {
   DaemonCreateResponseLostError,
@@ -25,6 +31,8 @@ import {
   type DaemonAgentSnapshot,
   type DaemonCreateAgentOptions,
   type DaemonExecutionControlOptions,
+  type DaemonExecutionPromptOptions,
+  type DaemonExecutionPromptResult,
   type DaemonEventHandler,
 } from "./protocol.js";
 
@@ -43,6 +51,15 @@ interface PendingControlRequest {
   resolve(): void;
   reject(error: Error): void;
 }
+interface PendingPromptRequest {
+  kind: "prompt";
+  generation: number;
+  executionId: string;
+  protocol: "execution" | "agent-rpc";
+  agentId?: string;
+  resolve(value: DaemonExecutionPromptResult): void;
+  reject(error: Error): void;
+}
 interface PendingAgentValidationRequest {
   kind: "agent-validation";
   generation: number;
@@ -53,12 +70,33 @@ interface AgentValidationIssue {
   path: readonly (string | number)[];
   message: string;
 }
-type PendingRequest = PendingCreateRequest | PendingControlRequest | PendingAgentValidationRequest;
+type PendingRequest =
+  | PendingCreateRequest
+  | PendingControlRequest
+  | PendingPromptRequest
+  | PendingAgentValidationRequest;
 interface ActiveSocket {
   generation: number;
   socket: WebSocket;
   daemon: DaemonRecord;
+  ready: boolean;
+  presenceReady: Promise<void>;
+  hubAgentRpc: boolean;
+  hubWorkspaceBindings: boolean;
 }
+
+export type DaemonSessionProtocol = "legacy" | "session-v1";
+
+const DAEMON_SESSION_PROTOCOL_HEADER = "x-paseo-session-protocol";
+const DAEMON_SESSION_PROTOCOL_VERSION = "1";
+
+/**
+ * How long Hub waits for a daemon to answer a prompt request.
+ *
+ * A missing acknowledgement must become a visible uncertain delivery, never an unbounded wait
+ * or an automatic second agent processing the same person's message.
+ */
+const DAEMON_PROMPT_TIMEOUT_MS = 10_000;
 
 type DaemonConnectedHandler = (daemon: DaemonRecord) => void | Promise<void>;
 type DaemonRevokedHandler = (daemon: DaemonRecord) => void | Promise<void>;
@@ -69,26 +107,30 @@ export class ActiveDaemonRegistry {
   private readonly subscribersByDaemon = new Map<string, Set<DaemonEventHandler>>();
   private readonly connectedHandlers = new Set<DaemonConnectedHandler>();
   private readonly revokedHandlers = new Set<DaemonRevokedHandler>();
-  private readonly offlinePresenceWrites = new Set<Promise<void>>();
+  private readonly presenceWrites = new Set<Promise<void>>();
   private generation = 0;
 
   constructor(
-    private readonly database: Pick<Database, "setDaemonPresence">,
+    private readonly database: Pick<Database, "setDaemonPresence" | "touchDaemon">,
     private readonly clock: DaemonClock = systemDaemonClock,
     private readonly failureLogger: Pick<Logger, "warn" | "error"> = defaultLogger,
   ) {}
 
-  accept(daemon: DaemonRecord, socket: WebSocket): void {
-    if (!daemon.scopes.includes("hub.execution.*")) {
-      socket.close(4403, "daemon scope unavailable");
-      return;
-    }
+  accept(
+    daemon: DaemonRecord,
+    socket: WebSocket,
+    sessionProtocol: DaemonSessionProtocol = "session-v1",
+  ): void {
     const previous = this.active.get(daemon.id);
     if (previous) this.rejectGeneration(daemon.id, previous.generation);
     const active: ActiveSocket = {
       generation: ++this.generation,
       socket,
       daemon,
+      ready: false,
+      presenceReady: Promise.resolve(),
+      hubAgentRpc: false,
+      hubWorkspaceBindings: false,
     };
     this.active.set(daemon.id, active);
     previous?.socket.close(4001, "replaced");
@@ -97,18 +139,31 @@ export class ActiveDaemonRegistry {
       if (this.active.get(daemon.id)?.generation === active.generation) {
         this.active.delete(daemon.id);
         this.rejectGeneration(daemon.id, active.generation);
-        const write = this.database.setDaemonPresence(daemon.id, "offline");
-        this.offlinePresenceWrites.add(write);
+        const write = active.presenceReady.then(() =>
+          this.database.setDaemonPresence(daemon.id, "offline"),
+        );
+        this.presenceWrites.add(write);
         void write.then(
-          () => this.offlinePresenceWrites.delete(write),
+          () => this.presenceWrites.delete(write),
           (error: unknown) => {
             this.report(error, "daemon.presence.offline", daemon.id);
           },
         );
       }
     });
-    for (const handler of this.connectedHandlers) {
-      this.observeHandler(() => handler(daemon), "daemon.connected.handler", daemon.id);
+    if (sessionProtocol === "legacy") {
+      this.markReady(active);
+    } else {
+      socket.send(
+        JSON.stringify(
+          HubDaemonHelloSchema.parse({
+            type: "hello",
+            clientId: `hub:${daemon.id}`,
+            clientType: "hub",
+            protocolVersion: 1,
+          }),
+        ),
+      );
     }
   }
 
@@ -124,10 +179,11 @@ export class ActiveDaemonRegistry {
 
   connection(daemonId: string): DaemonConnection | undefined {
     const active = this.active.get(daemonId);
-    if (!active) return undefined;
+    if (!active?.ready || !active.daemon.permissions.includes("hub.execute")) return undefined;
     return {
       createAgent: (options) => this.createAgent(daemonId, options),
       controlExecution: (options) => this.controlExecution(daemonId, options),
+      promptExecution: (options) => this.promptExecution(daemonId, options),
       on: (handler) => {
         const subscribers = this.subscribersFor(daemonId);
         subscribers.add(handler);
@@ -141,7 +197,10 @@ export class ActiveDaemonRegistry {
     agent: import("../config/compiler.js").CompiledAgent,
   ): Promise<{ valid: true } | { valid: false; issues: readonly AgentValidationIssue[] }> {
     const active = this.active.get(daemonId);
-    if (!active) return Promise.reject(new Error("daemon_not_connected"));
+    if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
+    if (!active.daemon.permissions.includes("hub.execute")) {
+      return Promise.reject(new Error("daemon_execution_not_allowed"));
+    }
     const requestId = randomUUID();
     const request = HubExecutionAgentValidateRequestSchema.parse({
       type: "hub.execution.agent.validate.request",
@@ -163,6 +222,39 @@ export class ActiveDaemonRegistry {
     });
   }
 
+  validateWorkspaceBinding(
+    daemonId: string,
+  ): { valid: true } | { valid: false; issues: readonly AgentValidationIssue[] } {
+    const active = this.active.get(daemonId);
+    const invalid = (
+      message: string,
+    ): { valid: false; issues: readonly AgentValidationIssue[] } => ({
+      valid: false,
+      issues: [{ path: [], message }],
+    });
+    if (!active?.ready || active.socket.readyState !== WebSocket.OPEN) {
+      return invalid(
+        "daemon_not_connected: Connect the selected daemon before enabling Linear issue workspace reuse.",
+      );
+    }
+    if (active.daemon.status !== "active" || !active.daemon.permissions.includes("hub.execute")) {
+      return invalid(
+        "daemon_execution_not_allowed: The selected daemon is not authorized to execute workflows.",
+      );
+    }
+    if (!active.hubWorkspaceBindings) {
+      return invalid(
+        "workspace_binding_unsupported: Update the selected Paseo daemon to support Linear issue workspace reuse, then reconnect it.",
+      );
+    }
+    return { valid: true };
+  }
+
+  updatePermissions(daemon: DaemonRecord): void {
+    const active = this.active.get(daemon.id);
+    if (active) active.daemon = daemon;
+  }
+
   async revoke(daemon: DaemonRecord): Promise<void> {
     try {
       await Promise.all(Array.from(this.revokedHandlers, async (handler) => handler(daemon)));
@@ -182,7 +274,7 @@ export class ActiveDaemonRegistry {
         }),
     );
     await Promise.all(sockets);
-    await Promise.all(this.offlinePresenceWrites);
+    await Promise.all(this.presenceWrites);
     for (const [daemonId, pending] of this.pendingByDaemon) {
       for (const request of pending.values()) request.reject(disconnectError(request));
       this.pendingByDaemon.delete(daemonId);
@@ -194,7 +286,19 @@ export class ActiveDaemonRegistry {
     options: DaemonCreateAgentOptions,
   ): Promise<{ id: string }> {
     const active = this.active.get(daemonId);
-    if (!active) return Promise.reject(new Error("daemon_not_connected"));
+    if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
+    if (
+      options.worktree?.mode === "branch-off" &&
+      options.worktree.workspaceKey !== undefined &&
+      !active.hubWorkspaceBindings
+    ) {
+      return Promise.reject(
+        new DaemonCreateRejectedError(
+          "Update the Paseo daemon to reuse the issue workspace safely",
+          "workspace_binding_unsupported",
+        ),
+      );
+    }
     const requestId = randomUUID();
     const executionId = options.executionId;
     const request = HubExecutionAgentCreateRequestSchema.parse({
@@ -236,7 +340,7 @@ export class ActiveDaemonRegistry {
     options: DaemonExecutionControlOptions,
   ): Promise<void> {
     const active = this.active.get(daemonId);
-    if (!active) return Promise.reject(new Error("daemon_not_connected"));
+    if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
     const requestId = randomUUID();
     const request = HubExecutionControlRequestSchema.parse({
       type: "hub.execution.control.request",
@@ -257,6 +361,70 @@ export class ActiveDaemonRegistry {
     });
   }
 
+  /**
+   * Sends a message to the agent an execution already owns.
+   *
+   * Select the protocol from the daemon's advertised capability, before sending. A timeout or
+   * disconnect may have lost only the acknowledgement, so neither triggers a second send using
+   * the other protocol. The lifecycle retains the durable input claim for reconciliation.
+   */
+  private promptExecution(
+    daemonId: string,
+    options: DaemonExecutionPromptOptions,
+  ): Promise<DaemonExecutionPromptResult> {
+    const active = this.active.get(daemonId);
+    if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
+    if (active.hubAgentRpc && options.agentId === undefined)
+      return Promise.resolve({ delivered: false, disposition: null });
+    const requestId = randomUUID();
+    const request = active.hubAgentRpc
+      ? DaemonAgentMessageRequestSchema.parse({
+          type: "send_agent_message_request",
+          requestId,
+          agentId: options.agentId,
+          text: options.prompt,
+          messageId: options.messageId ?? requestId,
+          ...(options.activeTurnBehavior === undefined
+            ? {}
+            : { activeTurnBehavior: options.activeTurnBehavior }),
+        })
+      : HubExecutionAgentPromptRequestSchema.parse({
+          type: "hub.execution.agent.prompt.request",
+          requestId,
+          executionId: options.executionId,
+          prompt: options.prompt,
+          ...(options.activeTurnBehavior === undefined
+            ? {}
+            : { activeTurnBehavior: options.activeTurnBehavior }),
+        });
+    return new Promise<DaemonExecutionPromptResult>((resolve, reject) => {
+      const pending = this.pendingFor(daemonId);
+      const timer = setTimeout(() => {
+        if (pending.get(requestId) !== entry) return;
+        pending.delete(requestId);
+        reject(new Error("daemon_prompt_timeout"));
+      }, DAEMON_PROMPT_TIMEOUT_MS);
+      timer.unref?.();
+      const entry: PendingPromptRequest = {
+        kind: "prompt",
+        generation: active.generation,
+        executionId: options.executionId,
+        protocol: active.hubAgentRpc ? "agent-rpc" : "execution",
+        ...(options.agentId === undefined ? {} : { agentId: options.agentId }),
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+      pending.set(requestId, entry);
+      active.socket.send(JSON.stringify({ type: "session", message: request }));
+    });
+  }
+
   private receive(active: ActiveSocket, raw: string): void {
     if (this.active.get(active.daemon.id)?.generation !== active.generation) return;
     const receivedAt = this.clock.nowDate().toISOString();
@@ -266,6 +434,11 @@ export class ActiveDaemonRegistry {
     } catch (error) {
       this.report(error, "daemon.websocket.message.parse", active.daemon.id, "validation");
       active.socket.close(4400, "invalid daemon message");
+      return;
+    }
+    const serverInfo = HubDaemonServerInfoEnvelopeSchema.safeParse(value);
+    if (serverInfo.success) {
+      this.acceptServerInfo(active, serverInfo.data.message.payload);
       return;
     }
     const envelope = HubExecutionOutboundSchema.safeParse(value);
@@ -278,6 +451,10 @@ export class ActiveDaemonRegistry {
     if (controlled.success) return this.receiveControl(active, controlled.data);
     const validated = HubExecutionAgentValidateResponseSchema.safeParse(message);
     if (validated.success) return this.receiveAgentValidation(active, validated.data);
+    const prompted = HubExecutionAgentPromptResponseSchema.safeParse(message);
+    if (prompted.success) return this.receivePrompt(active, prompted.data);
+    const messaged = DaemonAgentMessageResponseSchema.safeParse(message);
+    if (messaged.success) return this.receiveAgentMessage(active, messaged.data);
     const update = HubExecutionAgentUpdateSchema.safeParse(message);
     if (update.success) {
       const event = {
@@ -300,6 +477,44 @@ export class ActiveDaemonRegistry {
       timestamp: receivedAt,
     } as const;
     this.notifySubscribers(active.daemon.id, event);
+  }
+
+  private acceptServerInfo(
+    active: ActiveSocket,
+    info: z.infer<typeof HubDaemonServerInfoEnvelopeSchema>["message"]["payload"],
+  ): void {
+    if (!samePermissions(info.permissions, active.daemon.permissions)) {
+      active.socket.close(4403, "daemon session permissions do not match enrollment");
+      return;
+    }
+    active.hubAgentRpc = info.features?.hubAgentRpc === true;
+    active.hubWorkspaceBindings = info.features?.hubWorkspaceBindings === true;
+    this.markReady(active);
+  }
+
+  private markReady(active: ActiveSocket): void {
+    if (active.ready) return;
+    active.ready = true;
+    const write = Promise.all([
+      this.database.touchDaemon(active.daemon.id),
+      this.database.setDaemonPresence(active.daemon.id, "connected"),
+    ]).then(
+      () => undefined,
+      (error: unknown) => this.report(error, "daemon.presence.connected", active.daemon.id),
+    );
+    active.presenceReady = write;
+    this.presenceWrites.add(write);
+    void write.then(() => {
+      this.presenceWrites.delete(write);
+      for (const handler of this.connectedHandlers) {
+        this.observeHandler(
+          () => handler(active.daemon),
+          "daemon.connected.handler",
+          active.daemon.id,
+        );
+      }
+      return undefined;
+    });
   }
 
   private notifySubscribers(daemonId: string, event: Parameters<DaemonEventHandler>[0]): void {
@@ -389,6 +604,53 @@ export class ActiveDaemonRegistry {
       return;
     }
     pending.resolve();
+  }
+
+  private receivePrompt(
+    active: ActiveSocket,
+    response: z.infer<typeof HubExecutionAgentPromptResponseSchema>,
+  ): void {
+    const requests = this.pendingFor(active.daemon.id);
+    const pending = requests.get(response.payload.requestId);
+    if (
+      !pending ||
+      pending.kind !== "prompt" ||
+      pending.protocol !== "execution" ||
+      pending.generation !== active.generation ||
+      pending.executionId !== response.payload.executionId
+    ) {
+      return;
+    }
+    requests.delete(response.payload.requestId);
+    if (response.payload.error !== null) {
+      pending.reject(new Error(response.payload.error));
+      return;
+    }
+    pending.resolve({
+      delivered: response.payload.delivered,
+      disposition: response.payload.disposition,
+    });
+  }
+
+  private receiveAgentMessage(
+    active: ActiveSocket,
+    response: z.infer<typeof DaemonAgentMessageResponseSchema>,
+  ): void {
+    const requests = this.pendingFor(active.daemon.id);
+    const pending = requests.get(response.payload.requestId);
+    if (
+      pending?.kind !== "prompt" ||
+      pending.protocol !== "agent-rpc" ||
+      pending.generation !== active.generation ||
+      pending.agentId !== response.payload.agentId
+    )
+      return;
+    requests.delete(response.payload.requestId);
+    if (response.payload.error !== null) {
+      pending.reject(new Error(response.payload.error));
+      return;
+    }
+    pending.resolve({ delivered: response.payload.accepted, disposition: null });
   }
 
   private receiveCreate(
@@ -492,8 +754,22 @@ function relatedCreateRequests(
   return related;
 }
 
-export function createDaemonUpgradeHandler(database: Database, registry: ActiveDaemonRegistry) {
+function samePermissions(actual: readonly string[], expected: readonly string[]): boolean {
+  return (
+    actual.length === expected.length && expected.every((permission) => actual.includes(permission))
+  );
+}
+
+export function createDaemonUpgradeHandler(
+  database: Pick<Database, "findDaemonById">,
+  registry: ActiveDaemonRegistry,
+) {
   const server = new WebSocketServer({ noServer: true });
+  server.on("headers", (headers, request) => {
+    if (request.headers[DAEMON_SESSION_PROTOCOL_HEADER] === DAEMON_SESSION_PROTOCOL_VERSION) {
+      headers.push(`${DAEMON_SESSION_PROTOCOL_HEADER}: ${DAEMON_SESSION_PROTOCOL_VERSION}`);
+    }
+  });
   return async function upgrade(
     request: IncomingMessage,
     socket: Duplex,
@@ -514,9 +790,13 @@ export function createDaemonUpgradeHandler(database: Database, registry: ActiveD
       !matchesVerifier(credential, daemon.credentialVerifier)
     )
       return rejectUpgrade(socket, 403);
-    await database.touchDaemon(daemon.id);
-    await database.setDaemonPresence(daemon.id, "connected");
-    server.handleUpgrade(request, socket, head, (webSocket) => registry.accept(daemon, webSocket));
+    const sessionProtocol =
+      request.headers[DAEMON_SESSION_PROTOCOL_HEADER] === DAEMON_SESSION_PROTOCOL_VERSION
+        ? "session-v1"
+        : "legacy";
+    server.handleUpgrade(request, socket, head, (webSocket) =>
+      registry.accept(daemon, webSocket, sessionProtocol),
+    );
   };
 }
 

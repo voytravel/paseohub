@@ -1,0 +1,1223 @@
+import { z } from "zod";
+import assert from "node:assert/strict";
+import { describe, it, vi } from "vitest";
+import type {
+  Database,
+  LinearConnectionRecord,
+  LinearConnectionTokenUpdate,
+  UpdateLinearConnectionTokensInput,
+} from "../../db/types.js";
+import { createMemoryDatabase } from "../../db/memory.js";
+import {
+  createLinearApiClient,
+  createLinearConnectionClient,
+  hasRequiredLinearAgentSessionScopes,
+  hasRequiredLinearScopes,
+  linearConnectionRequiresReauthorization,
+} from "./client.js";
+
+describe("Linear connection client", () => {
+  it.each(["graphql", "oauth", "revoke"])(
+    "bounds a stalled %s request so durable delivery can retry",
+    async (endpoint) => {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      const deadline = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => timeout(1));
+      const request: typeof fetch = async (_url, init) => {
+        const signal = init?.signal;
+        assert.ok(signal);
+        return new Promise<Response>((_resolve, reject) => {
+          if (signal.aborted) reject(new Error("request aborted"));
+          else
+            signal.addEventListener("abort", () => reject(new Error("request aborted")), {
+              once: true,
+            });
+        });
+      };
+      try {
+        const connectionClient = createLinearConnectionClient({
+          clientId: "client",
+          clientSecret: "secret",
+          publicBaseUrl: "https://hub.test",
+          fetch: request,
+        });
+        const api = createLinearApiClient({
+          connectionForLinearOrganization: async () => linearConnection(),
+          withLinearConnectionRefresh: withinLinearRefresh(linearConnection(), async () => {}),
+          connectionClient,
+          fetch: request,
+        });
+        let operation: Promise<unknown>;
+        if (endpoint === "graphql")
+          operation = api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue" });
+        else if (endpoint === "oauth") operation = connectionClient.exchangeCode("code");
+        else operation = connectionClient.revoke("token");
+        await assert.rejects(operation, /request aborted/u);
+        assert.equal(deadline.mock.calls[0]?.[0], 20_000);
+      } finally {
+        deadline.mockRestore();
+      }
+    },
+  );
+  it("uses an OAuth callback URL and records the installed workspace identity", async () => {
+    const requests: Array<{ url: string; body: string }> = [];
+    const client = createLinearConnectionClient({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      publicBaseUrl: "https://hub.test/base",
+      now: () => new Date(1_700_000_000_000),
+      fetch: async (url, init) => {
+        const requestUrl = readableUrl(url);
+        requests.push({ url: requestUrl, body: readableBody(init?.body) });
+        if (requestUrl.endsWith("/oauth/token")) {
+          return json({
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            expires_in: 3600,
+            scope: "read,comments:create",
+          });
+        }
+        return json({
+          data: { viewer: { id: "app-user", organization: { id: "linear-org", name: "Acme" } } },
+        });
+      },
+    });
+
+    const authorization = new URL(client.authorizationUrl("state-value"));
+    assert.equal(authorization.origin, "https://linear.app");
+    assert.equal(
+      authorization.searchParams.get("redirect_uri"),
+      "https://hub.test/api/integrations/linear/callback",
+    );
+    assert.equal(authorization.searchParams.get("scope"), "read,comments:create");
+    assert.equal(authorization.searchParams.get("actor"), "app");
+    assert.equal(authorization.searchParams.get("state"), "state-value");
+
+    assert.deepEqual(await client.exchangeCode("code-value"), {
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Acme",
+      appUserId: "app-user",
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      accessTokenExpiresAt: new Date(1_700_003_600_000),
+      scopes: ["comments:create", "read"],
+    });
+    assert.match(requests[0]?.body ?? "", /code=code-value/u);
+  });
+
+  it("keeps the explicitly requested scope set when Linear omits it", async () => {
+    const client = createLinearConnectionClient({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      publicBaseUrl: "https://hub.test",
+      fetch: async (url) => {
+        if (readableUrl(url).endsWith("/oauth/token")) {
+          return json({ access_token: "access-token", refresh_token: "refresh-token" });
+        }
+        return json({
+          data: { viewer: { id: "app-user", organization: { id: "linear-org", name: "Acme" } } },
+        });
+      },
+    });
+
+    const baseline = await client.exchangeCode("baseline-code");
+    const authorization = new URL(client.authorizationUrl("state-value", "agentSessions"));
+    const agentSessions = await client.exchangeCode("agent-code", "agentSessions");
+
+    assert.deepEqual(baseline.scopes, ["read", "comments:create"]);
+    assert.equal(
+      authorization.searchParams.get("scope"),
+      "read,write,app:assignable,app:mentionable",
+    );
+    assert.deepEqual(agentSessions.scopes, ["read", "write", "app:assignable", "app:mentionable"]);
+  });
+
+  it("reads the issue team used for routing", async () => {
+    let requestBody = "";
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => linearConnection(),
+      withLinearConnectionRefresh: withinLinearRefresh(linearConnection(), async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requestBody = readableBody(init?.body);
+        return json({
+          data: {
+            issue: {
+              id: "issue-1",
+              identifier: "ENG-42",
+              title: "Ship the feature",
+              description: null,
+              project: null,
+              team: { id: "team-1" },
+              state: { id: "ready" },
+              assignee: null,
+              labels: { nodes: [] },
+            },
+          },
+        });
+      },
+    });
+
+    assert.deepEqual(
+      await api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue-1" }),
+      {
+        id: "issue-1",
+        identifier: "ENG-42",
+        title: "Ship the feature",
+        description: null,
+        projectId: null,
+        teamId: "team-1",
+        stateId: "ready",
+        assigneeId: null,
+        labelIds: [],
+      },
+    );
+    assert.match(graphqlRequest(requestBody).query, /team \{ id \}/u);
+  });
+
+  it("does not turn a missing provider assignee relation into a verified unassignment", async () => {
+    const { api } = recordingApi({
+      data: { issue: { id: "issue-1", title: "Incomplete response", labels: { nodes: [] } } },
+    });
+    await assert.rejects(
+      api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue-1" }),
+      (error: unknown) =>
+        error instanceof z.ZodError && error.issues[0]?.path.join(".") === "data.issue.assignee",
+    );
+  });
+
+  it("reads a bounded, chronological history before the triggering comment", async () => {
+    const requests: Array<{ authorization: string | null; body: string }> = [];
+    const connection: LinearConnectionRecord = {
+      id: "connection-1",
+      organizationId: "hub-org",
+      slug: "acme-linear",
+      providerApplicationId: "linear-app",
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Acme",
+      appUserId: "app-user",
+      accessToken: "access-token",
+      refreshToken: "refresh-token",
+      accessTokenExpiresAt: null,
+      scopes: ["comments:create", "read"],
+    };
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push({
+          authorization: new Headers(init?.headers).get("authorization"),
+          body: readableBody(init?.body),
+        });
+        return json({
+          data: {
+            comments: {
+              nodes: [
+                {
+                  id: "comment-2",
+                  body: "second",
+                  createdAt: "2023-11-14T22:13:19.002Z",
+                  user: { id: "user-2", name: "Paseo" },
+                },
+                {
+                  id: "comment-1",
+                  body: "first",
+                  createdAt: "2023-11-14T22:13:19.001Z",
+                  user: null,
+                },
+              ],
+              pageInfo: { hasPreviousPage: true },
+            },
+          },
+        });
+      },
+    });
+
+    const history = await api.readIssueComments({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      beforeCreatedAt: "2023-11-14T22:13:19.003Z",
+    });
+
+    assert.deepEqual(history, {
+      complete: false,
+      comments: [
+        {
+          id: "comment-1",
+          body: "first",
+          createdAt: "2023-11-14T22:13:19.001Z",
+          author: null,
+        },
+        {
+          id: "comment-2",
+          body: "second",
+          createdAt: "2023-11-14T22:13:19.002Z",
+          author: { id: "user-2", name: "Paseo" },
+        },
+      ],
+    });
+    assert.equal(requests[0]?.authorization, "Bearer access-token");
+    const request = graphqlRequest(requests[0]?.body ?? "{}");
+    // The issue filter compares an ID; Linear rejects a String variable in that position.
+    assert.match(request.query, /\$issueId: ID!/u);
+    assert.match(request.query, /issue: \{ id: \{ eq: \$issueId \} \}/u);
+    assert.match(request.query, /\$before: DateTimeOrDuration!/u);
+    assert.match(request.query, /last: 49/u);
+    assert.match(request.query, /orderBy: createdAt/u);
+    assert.match(request.query, /createdAt: \{ lt: \$before \}/u);
+    assert.deepEqual(request.variables, {
+      issueId: "issue-1",
+      before: "2023-11-14T22:13:19.003Z",
+    });
+  });
+
+  it("reads a comment's thread root, its distinct authors, and the issue's session roots", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    let issue: unknown = {
+      agentSessions: {
+        nodes: [
+          { comment: { id: "session-root" } },
+          { comment: { id: "session-root" } },
+          { comment: null },
+          { comment: { id: "root-1" } },
+        ],
+      },
+    };
+    let parent: unknown = {
+      id: "root-1",
+      user: { id: "user-1" },
+      botActor: null,
+      children: {
+        nodes: [
+          { user: { id: "app-user" }, botActor: null },
+          { user: null, botActor: { id: "bot-1" } },
+          { user: { id: "user-1" }, botActor: null },
+        ],
+      },
+    };
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({
+          data: {
+            comment: {
+              id: "reply-2",
+              user: { id: "user-2" },
+              botActor: null,
+              parent,
+              children: { nodes: [] },
+              issue,
+            },
+          },
+        });
+      },
+    });
+
+    assert.deepEqual(
+      await api.readCommentThread({ linearOrganizationId: "linear-org", commentId: "reply-2" }),
+      {
+        rootId: "root-1",
+        authorIds: ["user-1", "app-user", "bot-1"],
+        agentSessionRootIds: ["session-root", "root-1"],
+      },
+    );
+    const request = graphqlRequest(requests[0] ?? "{}");
+    assert.match(request.query, /comment\(id: \$id\)/u);
+    assert.match(
+      request.query,
+      /parent \{[\s\S]*children\(first: 100\) \{ nodes \{ user \{ id \} botActor \{ id \} \} \}/u,
+    );
+    // The session roots come from the same request, off the comment's issue.
+    assert.match(
+      request.query,
+      /issue \{ agentSessions\(first: 50\) \{ nodes \{ comment \{ id \} \} \} \}/u,
+    );
+    assert.deepEqual(request.variables, { id: "reply-2" });
+
+    // A root comment is its own thread root; a comment without an issue has no sessions.
+    parent = null;
+    issue = null;
+    assert.deepEqual(
+      await api.readCommentThread({ linearOrganizationId: "linear-org", commentId: "reply-2" }),
+      { rootId: "reply-2", authorIds: ["user-2"], agentSessionRootIds: [] },
+    );
+    assert.equal(requests.length, 2);
+  });
+
+  it("reads bounded agent-session activity before the prompting activity", async () => {
+    const requests: string[] = [];
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => linearConnection(),
+      withLinearConnectionRefresh: withinLinearRefresh(linearConnection(), async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({
+          data: {
+            agentSession: {
+              activities: {
+                nodes: [
+                  {
+                    id: "activity-2",
+                    createdAt: "2023-11-14T22:13:19.002Z",
+                    user: { id: "app-user", name: "Paseo" },
+                    content: {
+                      __typename: "AgentActivityActionContent",
+                      type: "action",
+                      action: "Opened pull request",
+                      parameter: "getpaseo/hub#59",
+                      result: "Ready for review",
+                    },
+                  },
+                  {
+                    id: "activity-1",
+                    createdAt: "2023-11-14T22:13:19.001Z",
+                    user: { id: "user-1", name: "Operator" },
+                    content: {
+                      __typename: "AgentActivityPromptContent",
+                      type: "prompt",
+                      body: "Please implement this",
+                    },
+                  },
+                ],
+                pageInfo: { hasPreviousPage: true },
+              },
+            },
+          },
+        });
+      },
+    });
+
+    assert.deepEqual(
+      await api.readAgentSessionActivities({
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        beforeCreatedAt: "2023-11-14T22:13:19.003Z",
+      }),
+      {
+        complete: false,
+        activities: [
+          {
+            id: "activity-1",
+            type: "prompt",
+            body: "Please implement this",
+            createdAt: "2023-11-14T22:13:19.001Z",
+            author: { id: "user-1", name: "Operator" },
+          },
+          {
+            id: "activity-2",
+            type: "action",
+            body: "Opened pull request: getpaseo/hub#59\n\nReady for review",
+            createdAt: "2023-11-14T22:13:19.002Z",
+            author: { id: "app-user", name: "Paseo" },
+          },
+        ],
+      },
+    );
+    const request = graphqlRequest(requests[0] ?? "{}");
+    assert.match(request.query, /\$before: DateTimeOrDuration!/u);
+    assert.match(request.query, /activities\(/u);
+    assert.match(request.query, /last: 49/u);
+    assert.match(request.query, /createdAt: \{ lt: \$before \}/u);
+    assert.deepEqual(request.variables, {
+      agentSessionId: "session-1",
+      before: "2023-11-14T22:13:19.003Z",
+    });
+  });
+
+  it("creates native Linear agent activities", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({ data: { agentActivityCreate: { success: true } } });
+      },
+    });
+
+    await api.createAgentActivity({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "response", body: "Draft PR opened." },
+    });
+
+    const request = graphqlRequest(requests[0] ?? "{}");
+    assert.match(request.query, /agentActivityCreate/u);
+    assert.deepEqual(request.variables, {
+      agentSessionId: "session-1",
+      content: { type: "response", body: "Draft PR opened." },
+    });
+  });
+
+  it("sends a select elicitation with its signal metadata", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({ data: { agentActivityCreate: { success: true } } });
+      },
+    });
+
+    await api.createAgentActivity({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "elicitation", body: "Which branch?" },
+      signal: "select",
+      signalMetadata: { options: [{ label: "main", value: "main" }] },
+    });
+
+    const request = graphqlRequest(requests[0] ?? "{}");
+    assert.match(request.query, /\$signal: AgentActivitySignal/u);
+    assert.match(request.query, /\$signalMetadata: JSONObject/u);
+    assert.match(request.query, /signalMetadata: \$signalMetadata/u);
+    assert.deepEqual(request.variables, {
+      agentSessionId: "session-1",
+      content: { type: "elicitation", body: "Which branch?" },
+      signal: "select",
+      signalMetadata: { options: [{ label: "main", value: "main" }] },
+    });
+  });
+
+  it("preserves the auth signal and target user in the actual GraphQL request", async () => {
+    const { api, requests } = recordingApi({ data: { agentActivityCreate: { success: true } } });
+    const input = {
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "elicitation" as const, body: "Connect the project account." },
+      signal: "auth" as const,
+      signalMetadata: {
+        url: "https://connect.composio.dev/link/example",
+        userId: "ceo",
+        providerName: "GitHub",
+      },
+    };
+    await api.createAgentActivity(input);
+    assert.deepEqual(graphqlRequest(requests[0]!).variables, {
+      agentSessionId: input.agentSessionId,
+      content: input.content,
+      signal: input.signal,
+      signalMetadata: input.signalMetadata,
+    });
+  });
+
+  it("reads the current delegate independently of the accountable human assignee", async () => {
+    const { api, requests } = recordingApi({
+      data: {
+        issue: {
+          id: "issue-1",
+          title: "Product feedback",
+          labels: { nodes: [] },
+          assignee: { id: "studio-reviewer" },
+          delegate: { id: "p-agent" },
+        },
+      },
+    });
+    const issue = await api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue-1" });
+    assert.equal(issue?.assigneeId, "studio-reviewer");
+    assert.equal(issue?.delegateId, "p-agent");
+    assert.match(graphqlRequest(requests[0]!).query, /delegate \{ id \}/u);
+  });
+
+  it("reads an existing native session on the root before a comment bridge creates one", async () => {
+    const { api, requests } = recordingApi({
+      data: {
+        comment: {
+          id: "reply",
+          children: { nodes: [] },
+          parent: {
+            id: "root",
+            user: { id: "ceo" },
+            children: { nodes: [] },
+            agentSession: {
+              id: "session-1",
+              appUser: { id: "p-agent" },
+              createdAt: "2026-09-09T12:00:01.000Z",
+            },
+          },
+          issue: { agentSessions: { nodes: [{ comment: { id: "root" } }] } },
+        },
+      },
+    });
+    assert.deepEqual(
+      await api.readCommentThread({ linearOrganizationId: "linear-org", commentId: "reply" }),
+      {
+        rootId: "root",
+        authorIds: ["ceo"],
+        agentSessionRootIds: ["root"],
+        agentSession: {
+          id: "session-1",
+          appUserId: "p-agent",
+          createdAt: "2026-09-09T12:00:01.000Z",
+        },
+      },
+    );
+    assert.match(
+      graphqlRequest(requests[0]!).query,
+      /agentSession \{ id createdAt appUser \{ id \} \}/u,
+    );
+  });
+
+  it("creates a native session using the documented root-comment input type", async () => {
+    const { api, requests } = recordingApi({
+      data: {
+        agentSessionCreateOnComment: {
+          success: true,
+          agentSession: { id: "native-session" },
+        },
+      },
+    });
+    assert.deepEqual(
+      await api.createAgentSessionOnComment({
+        linearOrganizationId: "linear-org",
+        commentId: "root",
+      }),
+      { id: "native-session" },
+    );
+    const request = graphqlRequest(requests[0]!);
+    assert.match(request.query, /\$input: AgentSessionCreateOnComment!/u);
+    assert.deepEqual(request.variables, { input: { commentId: "root" } });
+  });
+
+  it("rejects an unsuccessful native session mutation", async () => {
+    const { api } = recordingApi({
+      data: {
+        agentSessionCreateOnComment: {
+          success: false,
+          agentSession: null,
+        },
+      },
+    });
+    await assert.rejects(() =>
+      api.createAgentSessionOnComment({ linearOrganizationId: "linear-org", commentId: "root" }),
+    );
+  });
+
+  it("replaces the native plan and appends PR links without replacing the Paseo session link", async () => {
+    const { api, requests } = recordingApi({ data: { agentSessionUpdate: { success: true } } });
+    const plan = [{ content: "Apply feedback", status: "inProgress" as const }];
+    await api.updateAgentSessionPlan({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      plan,
+    });
+    assert.deepEqual(graphqlRequest(requests[0]!).variables, { id: "session-1", plan });
+    assert.match(graphqlRequest(requests[0]!).query, /plan: \$plan/u);
+    await api.updateAgentSessionExternalUrls({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      externalUrls: [{ label: "PR", url: "https://github.com/acme/repo/pull/42" }],
+    });
+    assert.match(graphqlRequest(requests[1]!).query, /addedExternalUrls: \$externalUrls/u);
+  });
+
+  it("propagates plan delivery rejection to output accounting", async () => {
+    const { api } = recordingApi({ data: { agentSessionUpdate: { success: false } } });
+    await assert.rejects(
+      () =>
+        api.updateAgentSessionPlan({
+          linearOrganizationId: "linear-org",
+          agentSessionId: "session-1",
+          plan: [],
+        }),
+      /plan was not accepted/u,
+    );
+  });
+
+  it("threads a comment under its parent only when a parent is given", async () => {
+    const requests: string[] = [];
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async (_url, init) => {
+        requests.push(readableBody(init?.body));
+        return json({ data: { commentCreate: { success: true } } });
+      },
+    });
+
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Done.",
+      parentId: "root-comment",
+    });
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Done.",
+    });
+
+    const threaded = graphqlRequest(requests[0] ?? "{}");
+    assert.match(threaded.query, /\$parentId: String\b/u);
+    assert.match(threaded.query, /parentId: \$parentId/u);
+    assert.deepEqual(threaded.variables, {
+      issueId: "issue-1",
+      body: "Done.",
+      parentId: "root-comment",
+    });
+    assert.deepEqual(graphqlRequest(requests[1] ?? "{}").variables, {
+      issueId: "issue-1",
+      body: "Done.",
+    });
+  });
+
+  it("surfaces Linear's own message when it rejects a comment", async () => {
+    const connection = linearConnection();
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+      connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+      fetch: async () =>
+        json({ errors: [{ message: "Parent comment must be a top level comment." }] }),
+    });
+
+    await assert.rejects(
+      api.createComment({
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        body: "Done.",
+        parentId: "nested-comment",
+      }),
+      { message: /Parent comment must be a top level comment\./u },
+    );
+  });
+
+  it("refreshes an expired token before calling the Linear GraphQL API", async () => {
+    const updates: unknown[] = [];
+    const requests: Array<{ url: string; authorization: string | null; body: string }> = [];
+    const connection: LinearConnectionRecord = {
+      id: "connection-1",
+      organizationId: "hub-org",
+      slug: "acme-linear",
+      providerApplicationId: "linear-app",
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Acme",
+      appUserId: "app-user",
+      accessToken: "expired-token",
+      refreshToken: "refresh-token",
+      accessTokenExpiresAt: new Date(1_700_000_000_000),
+      scopes: ["comments:create", "read"],
+    };
+    const updateTokens = async (update: UpdateLinearConnectionTokensInput) => {
+      updates.push(update);
+    };
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, updateTokens),
+      connectionClient: {
+        refresh: async () => ({
+          accessToken: "fresh-token",
+          refreshToken: "next-refresh-token",
+          accessTokenExpiresAt: new Date(1_700_003_600_000),
+          scopes: ["comments:create", "read"],
+        }),
+      },
+      now: () => new Date(1_700_000_010_000),
+      fetch: async (url, init) => {
+        requests.push({
+          url: readableUrl(url),
+          authorization: new Headers(init?.headers).get("authorization"),
+          body: readableBody(init?.body),
+        });
+        return json({ data: { commentCreate: { success: true } } });
+      },
+    });
+
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Done",
+    });
+    assert.deepEqual(updates, [
+      {
+        connectionId: "connection-1",
+        accessToken: "fresh-token",
+        refreshToken: "next-refresh-token",
+        accessTokenExpiresAt: new Date(1_700_003_600_000),
+        scopes: ["comments:create", "read"],
+      },
+    ]);
+    assert.equal(requests[0]?.authorization, "Bearer fresh-token");
+    assert.match(requests[0]?.body ?? "", /commentCreate/u);
+  });
+
+  it("clears a stale expiry when Linear omits it from a refresh response", async () => {
+    const updates: unknown[] = [];
+    let tokenRequests = 0;
+    const connection: LinearConnectionRecord = {
+      id: "connection-1",
+      organizationId: "hub-org",
+      slug: "acme-linear",
+      providerApplicationId: "linear-app",
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Acme",
+      appUserId: "app-user",
+      accessToken: "expired-token",
+      refreshToken: "refresh-token",
+      accessTokenExpiresAt: new Date(1_700_000_000_000),
+      scopes: ["comments:create", "read"],
+    };
+    const request: typeof fetch = async (url) => {
+      if (readableUrl(url).endsWith("/oauth/token")) {
+        tokenRequests += 1;
+        return json({ access_token: "fresh-token" });
+      }
+      return json({ data: { commentCreate: { success: true } } });
+    };
+    const updateTokens = async (update: UpdateLinearConnectionTokensInput) => {
+      updates.push(update);
+      connection.accessToken = update.accessToken;
+      if (update.refreshToken !== undefined) connection.refreshToken = update.refreshToken;
+      if (update.accessTokenExpiresAt !== undefined)
+        connection.accessTokenExpiresAt = update.accessTokenExpiresAt;
+      if (update.scopes !== undefined) connection.scopes = update.scopes;
+    };
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: withinLinearRefresh(connection, updateTokens),
+      connectionClient: createLinearConnectionClient({
+        clientId: "client-id",
+        clientSecret: "client-secret",
+        publicBaseUrl: "https://hub.test",
+        fetch: request,
+        now: () => new Date(1_700_000_010_000),
+      }),
+      fetch: request,
+      now: () => new Date(1_700_000_010_000),
+    });
+
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Done",
+    });
+    await api.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "Still done",
+    });
+
+    assert.deepEqual(updates, [
+      {
+        connectionId: "connection-1",
+        accessToken: "fresh-token",
+        accessTokenExpiresAt: null,
+      },
+    ]);
+    assert.equal(tokenRequests, 1);
+  });
+
+  it("coalesces concurrent refreshes for one Linear connection", async () => {
+    const connection: LinearConnectionRecord = {
+      id: "connection-1",
+      organizationId: "hub-org",
+      slug: "acme-linear",
+      providerApplicationId: "linear-app",
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Acme",
+      appUserId: "app-user",
+      accessToken: "expired-token",
+      refreshToken: "refresh-token",
+      accessTokenExpiresAt: new Date(1_700_000_000_000),
+      scopes: ["comments:create", "read"],
+    };
+    const updates: unknown[] = [];
+    const requests: string[] = [];
+    let connectionReads = 0;
+    let releaseConnections!: () => void;
+    let markBothConnectionsRead!: () => void;
+    let releaseRefresh!: (value: { accessToken: string; refreshToken: string }) => void;
+    let markRefreshStarted!: () => void;
+    const connectionsReleased = new Promise<void>((resolve) => {
+      releaseConnections = resolve;
+    });
+    const bothConnectionsRead = new Promise<void>((resolve) => {
+      markBothConnectionsRead = resolve;
+    });
+    const refreshStarted = new Promise<void>((resolve) => {
+      markRefreshStarted = resolve;
+    });
+    const refreshed = new Promise<{ accessToken: string; refreshToken: string }>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let refreshCalls = 0;
+    const updateTokens = async (update: UpdateLinearConnectionTokensInput) => {
+      updates.push(update);
+    };
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => {
+        connectionReads += 1;
+        if (connectionReads === 2) markBothConnectionsRead();
+        await connectionsReleased;
+        return connection;
+      },
+      withLinearConnectionRefresh: withinLinearRefresh(connection, updateTokens),
+      connectionClient: {
+        refresh: async () => {
+          refreshCalls += 1;
+          markRefreshStarted();
+          return refreshed;
+        },
+      },
+      now: () => new Date(1_700_000_010_000),
+      fetch: async (_url, init) => {
+        requests.push(new Headers(init?.headers).get("authorization") ?? "");
+        return json({ data: { commentCreate: { success: true } } });
+      },
+    });
+
+    const operations = [
+      api.createComment({ linearOrganizationId: "linear-org", issueId: "issue-1", body: "One" }),
+      api.createComment({ linearOrganizationId: "linear-org", issueId: "issue-2", body: "Two" }),
+    ];
+    await bothConnectionsRead;
+    releaseConnections();
+    await refreshStarted;
+
+    assert.equal(refreshCalls, 1);
+    releaseRefresh({ accessToken: "fresh-token", refreshToken: "next-refresh-token" });
+    await Promise.all(operations);
+
+    assert.deepEqual(updates, [
+      {
+        connectionId: "connection-1",
+        accessToken: "fresh-token",
+        refreshToken: "next-refresh-token",
+      },
+    ]);
+    assert.deepEqual(requests, ["Bearer fresh-token", "Bearer fresh-token"]);
+  });
+
+  it("serializes rotating-token refreshes across Linear API clients", async () => {
+    const locks = createMemoryDatabase();
+    const lockKeys: string[] = [];
+    const connection: LinearConnectionRecord = {
+      id: "connection-1",
+      organizationId: "hub-org",
+      slug: "acme-linear",
+      providerApplicationId: "linear-app",
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Acme",
+      appUserId: "app-user",
+      accessToken: "expired-token",
+      refreshToken: "rotating-refresh-token",
+      accessTokenExpiresAt: new Date(1_700_000_000_000),
+      scopes: ["comments:create", "read"],
+    };
+    const updates: unknown[] = [];
+    const requests: string[] = [];
+    let connectionReads = 0;
+    let refreshCalls = 0;
+    let releaseRefresh!: () => void;
+    let markRefreshStarted!: () => void;
+    let markSecondInitialRead!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => {
+      markRefreshStarted = resolve;
+    });
+    const secondInitialRead = new Promise<void>((resolve) => {
+      markSecondInitialRead = resolve;
+    });
+    const refreshReleased = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const connectionForLinearOrganization = async () => {
+      connectionReads += 1;
+      if (connectionReads === 2) markSecondInitialRead();
+      return connection;
+    };
+    const updateTokens = async (update: {
+      connectionId: string;
+      accessToken: string;
+      refreshToken?: string | null;
+      accessTokenExpiresAt?: Date | null;
+      scopes?: string[];
+    }) => {
+      updates.push(update);
+      connection.accessToken = update.accessToken;
+      if (update.refreshToken !== undefined) connection.refreshToken = update.refreshToken;
+      if (update.accessTokenExpiresAt !== undefined)
+        connection.accessTokenExpiresAt = update.accessTokenExpiresAt;
+      if (update.scopes !== undefined) connection.scopes = update.scopes;
+    };
+    const withLinearConnectionRefresh: Database["withLinearConnectionRefresh"] = async (
+      linearOrganizationId,
+      operation,
+    ) => {
+      const key = JSON.stringify(["paseo-connection", "linear", "external", linearOrganizationId]);
+      lockKeys.push(key);
+      const updateWithinRefresh = (input: LinearConnectionTokenUpdate) =>
+        updateTokens({ connectionId: connection.id, ...input });
+      return locks.withAdvisoryLock(key, () => operation(connection, updateWithinRefresh));
+    };
+    const sharedOptions = {
+      connectionForLinearOrganization,
+      withLinearConnectionRefresh,
+      connectionClient: {
+        refresh: async () => {
+          refreshCalls += 1;
+          markRefreshStarted();
+          await refreshReleased;
+          return {
+            accessToken: "fresh-token",
+            refreshToken: "next-rotating-refresh-token",
+            accessTokenExpiresAt: new Date(1_700_003_600_000),
+          };
+        },
+      },
+      now: () => new Date(1_700_000_010_000),
+      fetch: async (_url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(new Headers(init?.headers).get("authorization") ?? "");
+        return json({ data: { commentCreate: { success: true } } });
+      },
+    };
+    const firstProcess = createLinearApiClient(sharedOptions);
+    const secondProcess = createLinearApiClient(sharedOptions);
+
+    const first = firstProcess.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      body: "One",
+    });
+    await refreshStarted;
+    const second = secondProcess.createComment({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-2",
+      body: "Two",
+    });
+    await secondInitialRead;
+    releaseRefresh();
+    await Promise.all([first, second]);
+
+    assert.equal(refreshCalls, 1);
+    assert.equal(connectionReads, 2);
+    assert.deepEqual(lockKeys, [
+      '["paseo-connection","linear","external","linear-org"]',
+      '["paseo-connection","linear","external","linear-org"]',
+    ]);
+    assert.deepEqual(updates, [
+      {
+        connectionId: "connection-1",
+        accessToken: "fresh-token",
+        refreshToken: "next-rotating-refresh-token",
+        accessTokenExpiresAt: new Date(1_700_003_600_000),
+      },
+    ]);
+    assert.deepEqual(requests, ["Bearer fresh-token", "Bearer fresh-token"]);
+  });
+
+  it("keeps optional Agent Session scopes separate from baseline connection health", () => {
+    assert.equal(hasRequiredLinearScopes(["read", "comments:create"]), true);
+    assert.equal(
+      hasRequiredLinearScopes(["read", "write", "app:assignable", "app:mentionable"]),
+      true,
+    );
+    assert.equal(hasRequiredLinearScopes(["read", "write"]), true);
+    assert.equal(hasRequiredLinearScopes(["read"]), false);
+    assert.equal(
+      hasRequiredLinearAgentSessionScopes(["read", "write", "app:assignable", "app:mentionable"]),
+      true,
+    );
+    assert.equal(hasRequiredLinearAgentSessionScopes(["read", "comments:create"]), false);
+    assert.equal(
+      linearConnectionRequiresReauthorization({
+        scopes: ["read", "comments:create"],
+        refreshToken: null,
+        accessTokenExpiresAt: null,
+      }),
+      false,
+    );
+  });
+});
+
+function linearConnection(): LinearConnectionRecord {
+  return {
+    id: "connection-1",
+    organizationId: "hub-org",
+    slug: "acme-linear",
+    providerApplicationId: "linear-app",
+    linearOrganizationId: "linear-org",
+    linearOrganizationName: "Acme",
+    appUserId: "app-user",
+    accessToken: "access-token",
+    refreshToken: "refresh-token",
+    accessTokenExpiresAt: null,
+    scopes: ["app:assignable", "app:mentionable", "read", "write"],
+  };
+}
+
+function json(value: unknown): Response {
+  return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function withinLinearRefresh(
+  connection: LinearConnectionRecord,
+  updateTokens: (input: UpdateLinearConnectionTokensInput) => Promise<void>,
+): Database["withLinearConnectionRefresh"] {
+  return async (_linearOrganizationId, operation) =>
+    operation(connection, (input) => updateTokens({ connectionId: connection.id, ...input }));
+}
+
+function readableUrl(value: RequestInfo | URL): string {
+  if (typeof value === "string") return value;
+  return value instanceof URL ? value.toString() : value.url;
+}
+
+function readableBody(value: BodyInit | null | undefined): string {
+  if (typeof value === "string") return value;
+  if (value instanceof URLSearchParams) return value.toString();
+  return "";
+}
+
+function graphqlRequest(value: string): { query: string; variables: unknown } {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    !("query" in parsed) ||
+    typeof parsed.query !== "string"
+  ) {
+    throw new Error("expected GraphQL request");
+  }
+  return { query: parsed.query, variables: "variables" in parsed ? parsed.variables : undefined };
+}
+
+function recordingApi(response: unknown) {
+  const requests: string[] = [];
+  const connection = linearConnection();
+  const api = createLinearApiClient({
+    connectionForLinearOrganization: async () => connection,
+    withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+    connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+    fetch: async (_url, init) => {
+      requests.push(readableBody(init?.body));
+      return json(response);
+    },
+  });
+  return { api, requests };
+}
+
+describe("Linear issue session reconciliation", () => {
+  function sessionApi(request: typeof fetch) {
+    return createLinearApiClient({
+      connectionForLinearOrganization: async () => linearConnection(),
+      withLinearConnectionRefresh: withinLinearRefresh(linearConnection(), async () => {}),
+      connectionClient: createLinearConnectionClient({
+        clientId: "client",
+        clientSecret: "secret",
+        publicBaseUrl: "https://hub.test",
+        fetch: request,
+      }),
+      fetch: request,
+    });
+  }
+
+  it("reads every page including archived sessions before returning and preserves exact marker URLs", async () => {
+    const cursors: unknown[] = [];
+    const api = sessionApi(async (_url, init) => {
+      const body = z
+        .object({ query: z.string(), variables: z.object({ after: z.string().nullable() }) })
+        .parse(JSON.parse(readableBody(init?.body)));
+      assert.match(body.query, /includeArchived: true/u);
+      assert.match(body.query, /externalLinks/u);
+      cursors.push(body.variables.after);
+      const second = body.variables.after === "cursor-1";
+      return json({
+        data: {
+          issue: {
+            agentSessions: {
+              nodes: [
+                {
+                  id: second ? "matching" : "unrelated",
+                  appUser: { id: "app" },
+                  externalLinks: second
+                    ? [{ label: "Paseo Hub", url: "https://hub.test/#linear-event=exact" }]
+                    : [],
+                },
+              ],
+              pageInfo: { hasNextPage: !second, endCursor: second ? null : "cursor-1" },
+            },
+          },
+        },
+      });
+    });
+    assert.ok(typeof api.readIssueSessions === "function");
+    const sessions = await api.readIssueSessions({
+      linearOrganizationId: "linear-org",
+      issueId: "issue",
+    });
+    assert.deepEqual(cursors, [null, "cursor-1"]);
+    assert.equal(sessions[1]?.externalUrls[0]?.url, "https://hub.test/#linear-event=exact");
+  });
+
+  it.each(["missing", "repeating", "limit"])(
+    "rejects %s pagination instead of returning a partial list",
+    async (mode) => {
+      let requests = 0;
+      const api = sessionApi(async () => {
+        requests += 1;
+        let endCursor: string | null = `cursor-${requests}`;
+        if (mode === "missing") endCursor = null;
+        if (mode === "repeating") endCursor = "same";
+        return json({
+          data: {
+            issue: {
+              agentSessions: {
+                nodes: [],
+                pageInfo: {
+                  hasNextPage: true,
+                  endCursor,
+                },
+              },
+            },
+          },
+        });
+      });
+      assert.ok(typeof api.readIssueSessions === "function");
+      await assert.rejects(
+        api.readIssueSessions({ linearOrganizationId: "linear-org", issueId: "issue" }),
+        /pagination/u,
+      );
+      const expectedRequests: Record<string, number> = { missing: 1, repeating: 2, limit: 100 };
+      assert.equal(requests, expectedRequests[mode]);
+    },
+  );
+
+  it("uses the public issue creation API and attaches its marker in that same mutation", async () => {
+    const externalUrls = [{ label: "Paseo Hub", url: "https://hub.test/#linear-event=marker" }];
+    const api = sessionApi(async (_url, init) => {
+      const body = z
+        .object({ query: z.string(), variables: z.unknown() })
+        .parse(JSON.parse(readableBody(init?.body)));
+      assert.match(body.query, /AgentSessionCreateOnIssue!/u);
+      assert.deepEqual(body.variables, { input: { issueId: "issue", externalUrls } });
+      return json({
+        data: { agentSessionCreateOnIssue: { success: true, agentSession: { id: "native" } } },
+      });
+    });
+    assert.ok(typeof api.createAgentSessionOnIssue === "function");
+    assert.deepEqual(
+      await api.createAgentSessionOnIssue({
+        linearOrganizationId: "linear-org",
+        issueId: "issue",
+        externalUrls,
+      }),
+      { id: "native" },
+    );
+  });
+});

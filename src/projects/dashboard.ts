@@ -34,6 +34,7 @@ import {
   decodeEntitlementDenialFailureReason,
   entitlementDenialSummary,
 } from "../entitlements/denial.js";
+import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { resolveRouteTenant } from "./access.js";
 import { ProjectCommandError } from "./command-error.js";
@@ -444,6 +445,13 @@ function connectionUsageView(
       teamName: connection.teamName,
       requiresReauthorization: !hasRequiredSlackScopes(connection.scopes),
     })),
+    linear: connections.linear.map((connection) => ({
+      id: connection.id,
+      slug: connection.slug,
+      linearOrganizationId: connection.linearOrganizationId,
+      linearOrganizationName: connection.linearOrganizationName,
+      requiresReauthorization: linearConnectionRequiresReauthorization(connection),
+    })),
   };
 }
 
@@ -490,8 +498,7 @@ function activityRunView(activity: ProjectActivityRunRecord) {
     receivedAt: receipt.receivedAt.toISOString(),
     rawPayload: jsonValue(receipt.payload),
     configuredTriggerName: run.configuredTriggerName,
-    rawMessage: run.rawPrompt,
-    cleanPrompt: run.prompt,
+    prompt: run.prompt,
     inputs: jsonValue(run.inputs),
     values: jsonValue(run.values),
     triggerContext: jsonValue(run.triggerContext),
@@ -545,8 +552,7 @@ function activityRunListView(activity: ProjectActivityRunListRecord) {
     repo: receipt.repo,
     receivedAt: receipt.receivedAt.toISOString(),
     configuredTriggerName: run.configuredTriggerName,
-    rawMessage: run.rawPrompt,
-    cleanPrompt: run.prompt,
+    prompt: run.prompt,
     inputs: jsonValue(run.inputs),
     values: jsonValue(run.values),
     outputContext: jsonValue(run.outputContext),
@@ -595,8 +601,7 @@ function unroutedEventView(receipt: ProviderEventReceiptSummary) {
     repo: receipt.repo,
     receivedAt: receipt.receivedAt.toISOString(),
     configuredTriggerName: null,
-    rawMessage: null,
-    cleanPrompt: null,
+    prompt: null,
     inputs: {},
     values: {},
     triggerContext: {},

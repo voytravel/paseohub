@@ -7,8 +7,10 @@ import type { HubExecutionAgentSnapshot } from "../../hub/protocol.js";
 import type {
   DaemonAgentSnapshot,
   DaemonConnection,
+  DaemonCreateAgentOptions,
   DaemonEvent,
   DaemonEventHandler,
+  DaemonExecutionPromptOptions,
 } from "../protocol.js";
 import { ActiveDaemonRegistry } from "../registry.js";
 
@@ -51,13 +53,13 @@ export class DaemonRegistryHarness {
     return harness;
   }
 
-  async pendingCreate(executionId: string): Promise<PendingRequest<DaemonAgentSnapshot>> {
-    const connection = this.connection();
-    const promise = connection.createAgent({
+  create(executionId: string, worktree?: DaemonCreateAgentOptions["worktree"]) {
+    return this.connection().createAgent({
       executionId,
       provider: "opencode",
       mode: "full-access",
       cwd: "/workspace",
+      ...(worktree === undefined ? {} : { worktree }),
       prompt: "Do the work",
       env: {},
       providerOptions: { permission: { edit: "ask", bash: "deny" } },
@@ -65,6 +67,13 @@ export class DaemonRegistryHarness {
         preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }],
       },
     });
+  }
+
+  async pendingCreate(
+    executionId: string,
+    worktree?: DaemonCreateAgentOptions["worktree"],
+  ): Promise<PendingRequest<DaemonAgentSnapshot>> {
+    const promise = this.create(executionId, worktree);
     void promise.catch(() => undefined);
     return {
       promise,
@@ -82,6 +91,27 @@ export class DaemonRegistryHarness {
       promise,
       request: await this.currentSocket().next("hub.execution.control.request"),
     };
+  }
+
+  async pendingPrompt(options: DaemonExecutionPromptOptions, publicRpc = false) {
+    const socket = this.currentSocket();
+    const promise = this.connection().promptExecution(options);
+    void promise.catch(() => undefined);
+    return {
+      promise,
+      request: await socket.next(
+        publicRpc ? "send_agent_message_request" : "hub.execution.agent.prompt.request",
+      ),
+      respond: (message: unknown) => socket.send(message),
+    };
+  }
+
+  prompt(options: DaemonExecutionPromptOptions) {
+    return this.connection().promptExecution(options);
+  }
+
+  pendingRequestTypes(): string[] {
+    return this.currentSocket().pendingRequestTypes();
   }
 
   async pendingAgentValidation() {
@@ -131,16 +161,21 @@ export class DaemonRegistryHarness {
     });
   }
 
-  async requestSettled(request: Promise<void>): Promise<boolean> {
+  async requestSettled(request: Promise<unknown>): Promise<boolean> {
     let settled = false;
-    void request.finally(() => {
+    const markSettled = () => {
       settled = true;
-    });
+    };
+    void request.then(markSettled, markSettled);
     await new Promise((resolve) => setImmediate(resolve));
     return settled;
   }
 
-  async replaceConnection(): Promise<{ supersededClosed: boolean }> {
+  async replaceConnection(
+    completeHello = true,
+    sessionProtocol: "legacy" | "session-v1" = "session-v1",
+    features: { hubAgentRpc?: boolean; hubWorkspaceBindings?: boolean } = {},
+  ): Promise<{ supersededClosed: boolean }> {
     const superseded = this.socket;
     const address = this.server.address();
     if (typeof address === "string" || address === null) throw new Error("Registry has no address");
@@ -151,10 +186,51 @@ export class DaemonRegistryHarness {
       client.once("error", reject);
     });
     const serverSocket = await accepted;
-    this.registry.accept(this.daemon, serverSocket);
+    const registrySocket = new RegistrySocket(
+      client,
+      completeHello ? this.daemon.permissions : null,
+      features,
+    );
+    let ready: Promise<void> | null = null;
+    let unsubscribeReady: () => void = () => undefined;
+    if (completeHello) {
+      let resolveReady!: () => void;
+      ready = new Promise<void>((resolve) => {
+        resolveReady = resolve;
+      });
+      unsubscribeReady = this.registry.onConnected(() => resolveReady());
+    }
+    this.registry.accept(this.daemon, serverSocket, sessionProtocol);
+    if (ready) await ready;
+    unsubscribeReady();
     this.clients.push(client);
-    this.socket = new RegistrySocket(client);
+    this.socket = registrySocket;
     return { supersededClosed: superseded?.closed ?? false };
+  }
+
+  connected(): boolean {
+    return this.registry.connection(this.daemon.id) !== undefined;
+  }
+
+  validateWorkspaceBinding() {
+    return this.registry.validateWorkspaceBinding(this.daemon.id);
+  }
+
+  updatePermissions(permissions: DaemonRecord["permissions"]): void {
+    this.registry.updatePermissions({ ...this.daemon, permissions });
+  }
+
+  async completeServerInfo(
+    permissions: readonly string[] = this.daemon.permissions,
+  ): Promise<void> {
+    let resolveReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const unsubscribe = this.registry.onConnected(() => resolveReady());
+    this.currentSocket().sendServerInfo(permissions);
+    if (sameStringSet(permissions, this.daemon.permissions)) await ready;
+    unsubscribe();
   }
 
   onConnected(handler: (daemon: DaemonRecord) => void | Promise<void>): () => void {
@@ -293,7 +369,7 @@ export class DaemonRegistryHarness {
 }
 
 class DaemonPresence {
-  private writes = 0;
+  private holdOffline = false;
   private writing: Promise<void> | undefined;
   private resolveWriting: (() => void) | undefined;
   private persistence: Promise<void> | undefined;
@@ -305,6 +381,7 @@ class DaemonPresence {
   }
 
   hold(): void {
+    this.holdOffline = true;
     this.writing = new Promise<void>((resolve) => {
       this.resolveWriting = resolve;
     });
@@ -314,16 +391,18 @@ class DaemonPresence {
   }
 
   async setDaemonPresence(_id: string, _presence: "offline" | "connected"): Promise<void> {
-    this.writes += 1;
     if (this.nextFailure !== undefined) {
       const error = this.nextFailure;
       this.nextFailure = undefined;
       throw error;
     }
-    if (this.writes !== 1) return;
+    if (_presence !== "offline" || !this.holdOffline) return;
+    this.holdOffline = false;
     this.resolveWriting?.();
     await this.persistence;
   }
+
+  async touchDaemon(_id: string): Promise<void> {}
 
   async waitUntilWriting(): Promise<void> {
     if (!this.writing) throw new Error("Offline presence is not held");
@@ -340,12 +419,21 @@ class RegistrySocket {
   private waiter: (() => void) | undefined;
   private didClose = false;
 
-  constructor(private readonly socket: WebSocket) {
+  constructor(
+    private readonly socket: WebSocket,
+    private readonly helloPermissions: readonly string[] | null,
+    private readonly features: { hubAgentRpc?: boolean; hubWorkspaceBindings?: boolean },
+  ) {
     socket.once("close", () => {
       this.didClose = true;
     });
     socket.on("message", (data) => {
-      this.messages.push(SessionRequestSchema.parse(JSON.parse(readText(data))).message);
+      const value = JSON.parse(readText(data)) as unknown;
+      if (isHubHello(value)) {
+        if (this.helloPermissions) this.sendServerInfo(this.helloPermissions);
+        return;
+      }
+      this.messages.push(SessionRequestSchema.parse(value).message);
       this.waiter?.();
       this.waiter = undefined;
     });
@@ -353,6 +441,10 @@ class RegistrySocket {
 
   get closed(): boolean {
     return this.didClose;
+  }
+
+  pendingRequestTypes(): string[] {
+    return this.messages.map((message) => message.type);
   }
 
   async next(type: string): Promise<z.infer<typeof SessionRequestSchema>["message"]> {
@@ -369,6 +461,18 @@ class RegistrySocket {
     this.socket.send(JSON.stringify({ type: "session", message }));
   }
 
+  sendServerInfo(permissions: readonly string[]): void {
+    this.send({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "test-daemon",
+        permissions,
+        features: this.features,
+      },
+    });
+  }
+
   sendRaw(value: string): void {
     this.socket.send(value);
   }
@@ -383,6 +487,14 @@ class RegistrySocket {
   }
 }
 
+function isHubHello(value: unknown): boolean {
+  return typeof value === "object" && value !== null && "type" in value && value.type === "hello";
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value) => right.includes(value));
+}
+
 function daemonRecord(): DaemonRecord {
   const now = new Date();
   return {
@@ -392,7 +504,7 @@ function daemonRecord(): DaemonRecord {
     serverId: randomUUID(),
     daemonPublicKey: "public-key",
     credentialVerifier: "verifier",
-    scopes: ["hub.execution.*"],
+    permissions: ["hub.execute"],
     registeredByApiKeyId: null,
     registeredByCliCredentialId: null,
     status: "active",

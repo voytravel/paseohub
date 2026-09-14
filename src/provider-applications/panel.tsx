@@ -110,8 +110,18 @@ function OverviewLoading() {
 /**
  * First run. The operator has an account and an organization and nothing else; the dashboard
  * would introduce projects before there is any reason to explain them.
+ *
+ * Leaving is a server fact — app onboarding is complete the moment the request succeeds, so a CLI
+ * authorization opened in another tab is no longer sent back here. Where the operator goes next
+ * is the journey's decision, not this surface's: `onLeft` is called once the server agrees.
  */
-export function AppSetupEntry({ organizationId }: { organizationId: string }) {
+export function AppSetupEntry({
+  organizationId,
+  onLeft,
+}: {
+  organizationId: string;
+  onLeft: () => void;
+}) {
   const queryClient = useQueryClient();
   const overview = useProviderApplicationsOverview();
   const connected = overview.data?.status === "ok" ? connectedProviderCount(overview.data.data) : 0;
@@ -122,7 +132,9 @@ export function AppSetupEntry({ organizationId }: { organizationId: string }) {
       input: Parameters<typeof completeAppSetup>[0],
     ) => Promise<Result<Record<string, never>>>,
     onSuccess: async (response) => {
-      if (response.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
+      if (response.status !== "ok") return;
+      await queryClient.invalidateQueries({ queryKey: ["account"] });
+      onLeft();
     },
   });
   const done = useCallback(() => finish.mutate({}), [finish]);
@@ -139,13 +151,13 @@ export function AppSetupEntry({ organizationId }: { organizationId: string }) {
           <h1
             ref={heading}
             tabIndex={-1}
-            className="text-xl font-semibold tracking-tight outline-none"
+            className="text-xl font-medium tracking-tight outline-none"
           >
             Set up your apps
           </h1>
           <p className="text-sm text-balance text-muted-foreground">
-            Paseo Hub talks to GitHub, Slack, and Discord through apps you create and own. Set up
-            the ones you want to use.
+            Paseo Hub talks to GitHub, Slack, Discord, and Linear through apps you create and own.
+            Set up the ones you want to use.
           </p>
         </div>
         <ExitFailure ref={exitFailure} message={exitFailureMessage(finish)} onRetry={done} />
@@ -215,7 +227,7 @@ export function AppsPanel() {
     <>
       <PageHeader
         title="Apps"
-        description="The GitHub, Slack, and Discord apps Hub uses to reach your workspaces."
+        description="The GitHub, Slack, Discord, and Linear apps Hub uses to reach your workspaces."
       />
       <div className="max-w-5xl">
         <ProviderApplications surface="apps" organizationId={account.organization.id} />
@@ -237,6 +249,7 @@ const RETURN_MESSAGES: Readonly<Record<string, SectionReturn>> = {
   github_connected: { tone: "success", message: "GitHub connected." },
   slack_connected: { tone: "success", message: "Slack connected." },
   discord_connected: { tone: "success", message: "Discord connected." },
+  linear_connected: { tone: "success", message: "Linear connected." },
   github_cancelled: {
     tone: "success",
     message: "Installation cancelled at GitHub. Nothing changed. Start again when you're ready.",
@@ -248,6 +261,10 @@ const RETURN_MESSAGES: Readonly<Record<string, SectionReturn>> = {
   discord_cancelled: {
     tone: "success",
     message: "Authorization cancelled at Discord. Nothing changed. Start again when you're ready.",
+  },
+  linear_cancelled: {
+    tone: "success",
+    message: "Authorization cancelled at Linear. Nothing changed. Start again when you're ready.",
   },
   github_approval_required: {
     tone: "error",
@@ -284,7 +301,14 @@ function readAppReturn(): AppReturn | undefined {
   const url = new URL(window.location.href);
   const provider = url.searchParams.get("app");
   const result = url.searchParams.get("result");
-  if (provider !== "github" && provider !== "slack" && provider !== "discord") return undefined;
+  if (
+    provider !== "github" &&
+    provider !== "slack" &&
+    provider !== "discord" &&
+    provider !== "linear"
+  ) {
+    return undefined;
+  }
   if (result === null) return undefined;
   return {
     provider,
@@ -298,6 +322,7 @@ function readAppReturn(): AppReturn | undefined {
 function providerName(provider: Provider): string {
   if (provider === "github") return "GitHub";
   if (provider === "slack") return "Slack";
+  if (provider === "linear") return "Linear";
   return "Discord";
 }
 

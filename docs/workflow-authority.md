@@ -3,6 +3,9 @@
 Workflow authority is authored on an individual step. It is not a trigger option,
 agent option, sandbox setting, or Paseo daemon feature.
 
+For the separate decision of who may start a Linear session, see
+[Linear session launch authority](linear-session-authority.md).
+
 ## Generic connection values
 
 Step environment values may explicitly request a named value from a configured
@@ -18,7 +21,7 @@ The expression shape is exactly
 materializing the selected step, after the project and organization connection
 have been verified. The authored expression, not its resolved value, is retained
 in configuration and durable launch data. Resolved values are not placed in logs
-or diagnostics. This works for manual, Discord, Slack, and GitHub trigger events.
+or diagnostics. This works for manual, Discord, Slack, GitHub, and Linear trigger events.
 
 ## GitHub authority
 

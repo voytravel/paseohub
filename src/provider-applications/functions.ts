@@ -11,7 +11,7 @@ import {
 } from "./index.js";
 import { providerApplicationSaveFailure, providerHost, providerName } from "./save-failure.js";
 
-const providerSchema = z.enum(["github", "slack", "discord"]);
+const providerSchema = z.enum(["github", "slack", "discord", "linear"]);
 const surfaceSchema = z.enum(["appSetup", "apps"]).optional();
 const expectedVersionSchema = z.number().int().positive().optional();
 const configurationSchema = z.discriminatedUnion("provider", [
@@ -45,11 +45,20 @@ const configurationSchema = z.discriminatedUnion("provider", [
     expectedVersion: expectedVersionSchema,
     surface: surfaceSchema,
   }),
+  z.object({
+    provider: z.literal("linear"),
+    clientId: z.string().trim().min(1),
+    clientSecret: z.string().min(1),
+    webhookSecret: z.string().min(1),
+    expectedVersion: expectedVersionSchema,
+    surface: surfaceSchema,
+  }),
 ]);
 const connectionSchema = z.object({
   provider: providerSchema,
   organizationId: z.string().min(1),
   surface: surfaceSchema,
+  linearAgentSessions: z.boolean().optional(),
 });
 const slackSocketSchema = z.object({
   appToken: z.string().trim().startsWith("xapp-").min(6),
@@ -108,13 +117,9 @@ export const beginProviderConnection = createServerFn({ method: "POST" })
     try {
       const capability = (await getApplication()).providerApplications;
       if (capability === null) throw new Error("unavailable");
+      const request = providerConnectionRequest(getRequest(), data);
       return respondOk(
-        await capability.beginConnection(
-          getRequest(),
-          data.provider,
-          data.organizationId,
-          data.surface,
-        ),
+        await capability.beginConnection(request, data.provider, data.organizationId, data.surface),
       );
     } catch (error) {
       const name = providerName(data.provider);
@@ -140,6 +145,16 @@ export const beginProviderConnection = createServerFn({ method: "POST" })
       );
     }
   });
+
+function providerConnectionRequest(
+  request: Request,
+  input: z.infer<typeof connectionSchema>,
+): Request {
+  if (input.provider !== "linear" || input.linearAgentSessions !== true) return request;
+  const url = new URL(request.url);
+  url.searchParams.set("linearAgentSessions", "true");
+  return new Request(url, { method: request.method, headers: request.headers });
+}
 
 export const configureSlackSocketApplication = createServerFn({ method: "POST" })
   .validator(slackSocketSchema)
@@ -191,6 +206,9 @@ function sensitiveConfigurationValues(
   if (configuration.provider === "slack") {
     return [configuration.clientSecret, configuration.signingSecret];
   }
+  if (configuration.provider === "linear") {
+    return [configuration.clientSecret, configuration.webhookSecret];
+  }
   return [configuration.clientSecret, configuration.botToken];
 }
 
@@ -219,6 +237,15 @@ function normalizedConfiguration(
       clientId: data.clientId,
       clientSecret: data.clientSecret,
       signingSecret: data.signingSecret,
+      ...version,
+    };
+  }
+  if (data.provider === "linear") {
+    return {
+      provider: data.provider,
+      clientId: data.clientId,
+      clientSecret: data.clientSecret,
+      webhookSecret: data.webhookSecret,
       ...version,
     };
   }

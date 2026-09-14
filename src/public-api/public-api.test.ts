@@ -12,11 +12,13 @@ import { DatabaseUnavailableError } from "../db/errors.js";
 import type { PublicOperations } from "../public-operations/index.js";
 import {
   ConfigurationResourcesSchema,
+  SetupResourcesSchema,
   createPublicApi,
   DispatchedManualRunSchema,
   EnrollmentTokenSchema,
   InstalledConfigurationSchema,
   ProjectListSchema,
+  TriggerListSchema,
   ProblemSchema,
   publicOperationManifest,
   publicOpenApiDocument,
@@ -91,6 +93,53 @@ describe("public API interface", () => {
     assert.deepEqual(await response.json(), { projectSlug: "project", valid: true });
   });
 
+  it.each(["workspace_binding_unsupported", "daemon_not_connected"])(
+    "surfaces %s in both configuration error details without losing structured issues",
+    async (code) => {
+      const issues = [
+        {
+          path: [".paseo/hub.yml", "environments", "issue", "worktree"],
+          message: `${code}: Connect a compatible daemon before enabling Linear issue workspace reuse.`,
+        },
+      ];
+      for (const path of ["/api/v1/configurations/validate", "/api/v1/configurations/install"]) {
+        const api = createPublicApi(
+          { status: "enabled", authenticator: authenticator() },
+          {
+            ...successfulOperations(),
+            validateConfiguration: async () => ({ status: "invalid_configuration", issues }),
+            installConfiguration: async () => ({ status: "invalid_configuration", issues }),
+          },
+        );
+        const response = await api.handle(installRequest(path));
+        assert.equal(response.status, 422);
+        const body = ProblemSchema.parse(await response.json());
+        assert.equal(body.code, "invalid_configuration");
+        assert.equal(body.detail, issues[0]!.message);
+        assert.deepEqual(body.issues, issues);
+      }
+    },
+  );
+
+  it("describes preflight rejection without inventing a recorded revision", async () => {
+    const api = createPublicApi(
+      { status: "enabled", authenticator: authenticator() },
+      {
+        ...successfulOperations(),
+        installConfiguration: async () => ({
+          status: "invalid_configuration",
+          issues: [{ path: [], message: "Invalid resources" }],
+        }),
+      },
+    );
+    const response = await api.handle(installRequest("/api/v1/configurations/install"));
+    assert.equal(response.status, 422);
+    assert.equal(
+      ProblemSchema.parse(await response.json()).detail,
+      "Configuration was rejected before creating a project or revision.",
+    );
+  });
+
   it("returns RFC 9457 request-correlated 404 and 405 responses at the canonical router", async () => {
     const api = createPublicApi(
       { status: "enabled", authenticator: authenticator() },
@@ -138,6 +187,15 @@ describe("public API interface", () => {
     InstalledConfigurationSchema.parse(
       await (await successApi.handle(installRequest("/api/v1/configurations/install"))).json(),
     );
+    TriggerListSchema.parse(
+      await (
+        await successApi.handle(
+          new Request("https://hub.test/api/v1/triggers", {
+            headers: { authorization: "Bearer valid" },
+          }),
+        )
+      ).json(),
+    );
     ProjectListSchema.parse(
       await (
         await successApi.handle(
@@ -155,6 +213,29 @@ describe("public API interface", () => {
           }),
         )
       ).json(),
+    );
+    assert.deepEqual(
+      SetupResourcesSchema.parse(
+        await (
+          await successApi.handle(
+            new Request("https://hub.test/api/v1/setup-resources", {
+              headers: { authorization: "Bearer valid" },
+            }),
+          )
+        ).json(),
+      ),
+      {
+        github: [
+          {
+            slug: "github-connection",
+            accountLogin: "octocat",
+            accountType: "User",
+            repositories: ["octocat/starter"],
+          },
+        ],
+        discord: [{ guildId: "123456789", guildName: "Paseo Guild" }],
+        slack: [{ teamId: "T01234567", teamName: "Paseo Workspace" }],
+      },
     );
     ValidatedConfigurationSchema.parse(
       await (await successApi.handle(installRequest("/api/v1/configurations/validate"))).json(),
@@ -265,6 +346,10 @@ describe("generated public OpenAPI", () => {
       "/api/v1/daemons/enrollment-tokens",
       "/api/v1/manual-runs",
       "/api/v1/projects",
+      "/api/v1/setup-resources",
+      "/api/v1/triggers",
+      "/api/v1/triggers/install",
+      "/api/v1/triggers/validate",
     ]);
     const expectations = {
       "/api/v1/configurations/install": [
@@ -279,6 +364,8 @@ describe("generated public OpenAPI", () => {
         "configuration:validate",
         ["200", "401", "403", "500", "503"],
       ],
+      "/api/v1/setup-resources": ["configuration:validate", ["200", "401", "403", "500", "503"]],
+      "/api/v1/triggers": ["configuration:validate", ["200", "401", "403", "500", "503"]],
       "/api/v1/projects": ["projects:read", ["200", "401", "403", "500", "503"]],
       "/api/v1/manual-runs": [
         "runs:dispatch",
@@ -288,7 +375,10 @@ describe("generated public OpenAPI", () => {
     } as const;
     for (const [path, [scope, statuses]] of Object.entries(expectations)) {
       const operation =
-        path === "/api/v1/projects" || path === "/api/v1/configuration-resources"
+        path === "/api/v1/projects" ||
+        path === "/api/v1/triggers" ||
+        path === "/api/v1/configuration-resources" ||
+        path === "/api/v1/setup-resources"
           ? publicOpenApiDocument.paths?.[path]?.get
           : publicOpenApiDocument.paths?.[path]?.post;
       assert.ok(operation?.operationId);
@@ -379,6 +469,29 @@ function authenticator(
 
 function successfulOperations(): PublicOperations {
   return {
+    listTriggers: () =>
+      Promise.resolve({
+        status: "listed",
+        triggers: [
+          {
+            id: "84af3583-23ff-4fcc-9838-ed3262499be2",
+            name: "mention",
+            enabled: true,
+            format: "single_run",
+            yaml: "name: mention\nenabled: true\n",
+          },
+        ],
+      }),
+    validateTrigger: () => Promise.resolve({ status: "valid", name: "mention", valid: true }),
+    installTrigger: () =>
+      Promise.resolve({
+        status: "installed",
+        triggerId: "84af3583-23ff-4fcc-9838-ed3262499be2",
+        name: "mention",
+        revisionId: "f83dc934-02a0-4849-8de7-699110be24ed",
+        version: 1,
+        active: true,
+      }),
     listProjects: () =>
       Promise.resolve({
         status: "listed",
@@ -397,6 +510,21 @@ function successfulOperations(): PublicOperations {
         github: [],
         discord: [],
         slack: [],
+        linear: [],
+      }),
+    listSetupResources: () =>
+      Promise.resolve({
+        status: "listed",
+        github: [
+          {
+            slug: "github-connection",
+            accountLogin: "octocat",
+            accountType: "User",
+            repositories: ["octocat/starter"],
+          },
+        ],
+        discord: [{ guildId: "123456789", guildName: "Paseo Guild" }],
+        slack: [{ teamId: "T01234567", teamName: "Paseo Workspace" }],
       }),
     validateConfiguration: () =>
       Promise.resolve({

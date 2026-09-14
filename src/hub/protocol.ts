@@ -50,6 +50,33 @@ export function isHubFinishExecutionToolName(name: string): boolean {
   return name === "hub.finish_execution" || name === "mcp__hub__finish_execution";
 }
 
+export const HubDaemonHelloSchema = z.object({
+  type: z.literal("hello"),
+  clientId: z.string(),
+  clientType: z.literal("hub"),
+  protocolVersion: z.literal(1),
+});
+
+export const HubDaemonServerInfoEnvelopeSchema = z.object({
+  type: z.literal("session"),
+  message: z.object({
+    type: z.literal("status"),
+    payload: z
+      .object({
+        status: z.literal("server_info"),
+        permissions: z.array(z.string()),
+        features: z
+          .object({
+            hubAgentRpc: z.boolean().optional(),
+            hubWorkspaceBindings: z.boolean().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough(),
+  }),
+});
+
 export const HubExecutionAgentStreamEventSchema = z.discriminatedUnion("type", [
   z
     .object({
@@ -205,6 +232,54 @@ export const HubExecutionAgentStreamSchema = z.object({
   }),
 });
 
+/**
+ * A message for an execution's agent, sent while that agent is alive.
+ *
+ * Mirrors `@getpaseo/protocol`. Hub could only create, interrupt or archive an agent; a
+ * conversational surface (a Linear agent session) had no way to reach the one it already started,
+ * so every message started a new agent with the thread replayed as text.
+ */
+export const HubExecutionAgentPromptRequestSchema = z.object({
+  type: z.literal("hub.execution.agent.prompt.request"),
+  requestId: z.string(),
+  executionId: z.string(),
+  prompt: z.string(),
+  activeTurnBehavior: z.enum(["interrupt", "steer"]).optional(),
+});
+
+export const HubExecutionAgentPromptResponseSchema = z.object({
+  type: z.literal("hub.execution.agent.prompt.response"),
+  payload: z.object({
+    requestId: z.string(),
+    executionId: z.string(),
+    /** False when the execution has no live agent left; the caller starts one instead. */
+    delivered: z.boolean(),
+    disposition: z.enum(["out_of_band", "steered", "turn_started"]).nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
+/** Public agent RPC advertised by Paseo 0.8 through `features.hubAgentRpc`. */
+export const DaemonAgentMessageRequestSchema = z.object({
+  type: z.literal("send_agent_message_request"),
+  requestId: z.string(),
+  // Never accept the public protocol's title/prefix lookup for an owned execution.
+  agentId: z.string().uuid(),
+  text: z.string(),
+  messageId: z.string(),
+  activeTurnBehavior: z.enum(["interrupt", "steer"]).optional(),
+});
+
+export const DaemonAgentMessageResponseSchema = z.object({
+  type: z.literal("send_agent_message_response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const HubExecutionControlActionSchema = z.enum(["interrupt", "archive"]);
 
 export const HubExecutionControlRequestSchema = z.object({
@@ -243,6 +318,8 @@ export const HubExecutionOutboundSchema = z.object({
     HubExecutionAgentStreamSchema,
     HubExecutionControlResponseSchema,
     HubExecutionAgentValidateResponseSchema,
+    HubExecutionAgentPromptResponseSchema,
+    DaemonAgentMessageResponseSchema,
     RpcErrorSchema,
   ]),
 });

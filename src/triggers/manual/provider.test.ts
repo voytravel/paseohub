@@ -14,7 +14,7 @@ describe("manual invocation provider", () => {
           name: "manual-request",
           on: "manual.run",
           max_runtime: "1h",
-          filters: { from_users: ["operator"], inputs: { repo: "hub" } },
+          filters: { from_users: ["*"], inputs: { repo: "hub" } },
           inputs: {
             repo: { type: "string", choices: ["paseo", "hub"] },
             agent: { type: "string", default: "codex", choices: ["codex", "opus"] },
@@ -53,8 +53,7 @@ describe("manual invocation provider", () => {
     assert.ok(match && typeof match !== "string");
     assert.deepEqual(match.invocation, {
       status: "accepted",
-      rawMessage: "repo=hub agent=opus investigate",
-      prompt: "investigate",
+      prompt: "repo=hub agent=opus investigate",
       inputs: { repo: "hub", agent: "opus" },
     });
   });

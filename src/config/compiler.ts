@@ -1,3 +1,4 @@
+import { LinearFinalizationPolicySchema } from "./linear-policy.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
@@ -84,9 +85,39 @@ const AuthoredTriggerFilterSchema = z
   .object({
     pattern: z.string().optional(),
     contains: z.string().optional(),
+    label: z.string().min(1).optional(),
+    labels: z.array(z.string().min(1)).min(1).optional(),
     repo: z.string().min(1).optional(),
     guild: z.string().min(1).optional(),
     workspace: z.string().min(1).optional(),
+    /** A Linear project UUID. It is deliberately a string so imported Linear IDs work verbatim. */
+    project: z.string().min(1).optional(),
+    /** A Linear team UUID, for workspaces where issues are not consistently project-scoped. */
+    team: z.string().min(1).optional(),
+    /** Linear workflow-state IDs which are eligible for this trigger. */
+    states: z.array(z.string().min(1)).min(1).optional(),
+    /** Linear label IDs which make an issue ineligible. */
+    exclude_labels: z.array(z.string().min(1)).min(1).optional(),
+    /** Linear user IDs which may be assigned to the issue. */
+    assignees: z.array(z.string().min(1)).min(1).optional(),
+    /** Restrict a Linear comment trigger to replies rather than root comments. */
+    replies_only: z.boolean().optional(),
+    /**
+     * Restrict a Linear comment trigger to replies in a plain comment thread the connection's
+     * app user has already commented in. Agent-session threads are excluded even though the
+     * app's responses appear there as comments: a reply in one already arrives as a session
+     * prompt, so this selects the threads a comment trigger alone answers.
+     */
+    thread_with_app: z.boolean().optional(),
+    /** Opt in to Linear-created sessions without a responsible human actor. */
+    allow_automated_sessions: z.boolean().optional(),
+    /** Publish the final native-session reply as an ordinary root issue comment too. */
+    publish_issue_comment: z.boolean().optional(),
+    /** Require the issue to remain delegated to this connection's app user. */
+    require_delegate: z.boolean().optional(),
+    continue_issue: z.boolean().optional(),
+    intake_triage_state_id: z.string().min(1).optional(),
+    finalize_issue: LinearFinalizationPolicySchema.optional(),
     channels: z.array(z.string().min(1)).optional(),
     from_users: z.array(z.string().min(1)).optional(),
     inputs: z.record(z.string(), InputValueSchema).optional(),
@@ -114,6 +145,8 @@ export const WorktreeTargetSchema = z.discriminatedUnion("mode", [
   z.object({
     mode: z.literal("branch-off"),
     newBranch: z.string().min(1),
+    reuseWorkspace: z.boolean().optional(),
+    workspaceKey: z.string().min(1).max(2048).optional(),
     base: z.string().min(1).optional(),
   }),
   z.object({ mode: z.literal("checkout-branch"), branch: z.string().min(1) }),
@@ -236,16 +269,23 @@ export interface CompiledStep {
   github?: CompiledGitHubAuthority | undefined;
   condition?: Expression | undefined;
   output?: { schema: JsonValue } | undefined;
-  allowOutputs: readonly { type: string; max: number; required: boolean }[];
+  allowOutputs: readonly { type: string; max?: number | undefined; required: boolean }[];
   autoArchive: boolean;
 }
 
 export type CompiledSteps = readonly CompiledStep[];
 
 export type CompiledTriggerFilter = Readonly<
-  Omit<AuthoredTriggerFilter, "channels" | "from_users"> & {
+  Omit<
+    AuthoredTriggerFilter,
+    "channels" | "from_users" | "states" | "labels" | "exclude_labels" | "assignees"
+  > & {
     channels?: readonly string[] | undefined;
     from_users?: readonly string[] | undefined;
+    states?: readonly string[] | undefined;
+    labels?: readonly string[] | undefined;
+    exclude_labels?: readonly string[] | undefined;
+    assignees?: readonly string[] | undefined;
     inputs?: Readonly<Record<string, JsonPrimitive>> | undefined;
     connectionId?: string | undefined;
     resourceId?: string | undefined;
@@ -380,7 +420,7 @@ const CompiledStepSchema: z.ZodType<CompiledStep> = z
       z
         .object({
           type: z.string().regex(EVENT_NAME),
-          max: z.number().int().positive(),
+          max: z.number().int().positive().optional(),
           required: z.boolean().default(false),
         })
         .strict(),
@@ -1312,10 +1352,107 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
 }
 
 function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
+  validateLinearFinalizationPolicy(trigger);
+  validateLinearTriageIntakePolicy(trigger);
+  validateDelegatedLinearCommentSecurity(trigger);
+  validateAutomatedLinearSessionSecurity(trigger);
   if (trigger.on === "manual.run") return;
+  // A project scout is an intentionally autonomous, project-scoped policy. Every other
+  // externally-originated Linear action remains actor-allowlisted below.
+  if (trigger.on === "linear.issue_entered_scope") {
+    if (trigger.filters?.project === undefined && trigger.filters?.team === undefined) {
+      throw new Error(
+        `trigger ${trigger.name} requires filters.project or filters.team for linear.issue_entered_scope`,
+      );
+    }
+    return;
+  }
+  // An assignment made by a triage rule has NO actor, so an actor allowlist rejects it by
+  // construction. `linear.issue_assigned` may therefore stand on the assignment itself — but only
+  // when it says both WHERE it listens and WHO the issue must land on, which is a narrower gate
+  // than the one `linear.issue_entered_scope` gets above.
+  if (trigger.on === "linear.issue_assigned" && (trigger.filters?.from_users?.length ?? 0) === 0) {
+    validateActorlessAssignment(trigger);
+    return;
+  }
   if ((trigger.filters?.from_users?.length ?? 0) === 0) {
     throw new Error(
       `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for externally sourced events`,
+    );
+  }
+}
+
+function validateDelegatedLinearCommentSecurity(trigger: CompiledTrigger): void {
+  if (
+    trigger.filters?.continue_issue === true &&
+    (!trigger.on.startsWith("linear.") ||
+      trigger.filters.require_delegate !== true ||
+      !trigger.filters.team ||
+      !(trigger.filters.connection ?? trigger.filters.connectionId) ||
+      !trigger.filters.from_users?.length ||
+      trigger.steps.length !== 1)
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} continue_issue requires one step, Linear team, connection, from_users and require_delegate`,
+    );
+  }
+  if (
+    (trigger.on === "linear.delegated_comment" ||
+      trigger.on === "linear.delegated_issue_updated") &&
+    (trigger.filters?.team === undefined ||
+      (trigger.filters.connection === undefined && trigger.filters.connectionId === undefined) ||
+      (trigger.filters.from_users?.length ?? 0) === 0)
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} requires team, connection and from_users for ${trigger.on}`,
+    );
+  }
+}
+
+function validateAutomatedLinearSessionSecurity(trigger: CompiledTrigger): void {
+  if (trigger.filters?.publish_issue_comment !== undefined && !trigger.on.startsWith("linear.")) {
+    throw new Error(
+      `trigger ${trigger.name} filters.publish_issue_comment is only supported for Linear`,
+    );
+  }
+  if (trigger.filters?.require_delegate !== undefined && !trigger.on.startsWith("linear.")) {
+    throw new Error(
+      `trigger ${trigger.name} filters.require_delegate is only supported for Linear`,
+    );
+  }
+  if (trigger.filters?.allow_automated_sessions !== undefined) {
+    if (trigger.on !== "linear.agent_session") {
+      throw new Error(
+        `trigger ${trigger.name} filters.allow_automated_sessions is only supported for linear.agent_session`,
+      );
+    }
+    if (
+      trigger.filters.allow_automated_sessions &&
+      (trigger.filters.team === undefined ||
+        (trigger.filters.connection === undefined && trigger.filters.connectionId === undefined))
+    ) {
+      throw new Error(
+        `trigger ${trigger.name} requires filters.team and filters.connection when filters.allow_automated_sessions is enabled`,
+      );
+    }
+  }
+}
+
+/**
+ * The gate an assignment trigger stands on when it names no actor.
+ *
+ * Narrower than the one `linear.issue_entered_scope` gets: it must say both WHERE it listens and
+ * WHO the issue has to land on, so an actorless event is bounded by the assignment itself.
+ */
+function validateActorlessAssignment(trigger: CompiledTrigger): void {
+  if (trigger.filters?.project === undefined && trigger.filters?.team === undefined) {
+    throw new Error(
+      `trigger ${trigger.name} requires filters.project or filters.team when linear.issue_assigned has no from_users allowlist`,
+    );
+  }
+  if ((trigger.filters?.assignees?.length ?? 0) === 0) {
+    throw new Error(
+      `trigger ${trigger.name} requires a non-empty filters.assignees when linear.issue_assigned has no from_users allowlist`,
     );
   }
 }
@@ -1405,4 +1542,41 @@ function stableJson(value: unknown): string {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
     .join(",")}}`;
+}
+
+function validateLinearFinalizationPolicy(trigger: CompiledTrigger): void {
+  const policy = trigger.filters?.finalize_issue;
+  if (policy === undefined) return;
+  if (
+    !trigger.on.startsWith("linear.") ||
+    trigger.filters?.require_delegate !== true ||
+    trigger.filters.publish_issue_comment !== true ||
+    trigger.filters.team !== policy.team_id ||
+    (trigger.filters.connection ?? trigger.filters.connectionId) === undefined ||
+    !trigger.filters.from_users?.length
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} finalize_issue requires scoped Linear delegation, published issue replies, and the same explicit team`,
+    );
+  }
+  if (policy.review_state_id === policy.completed_state_id) {
+    throw new Error(
+      `trigger ${trigger.name} finalize_issue requires different review and completed states`,
+    );
+  }
+}
+
+function validateLinearTriageIntakePolicy(trigger: CompiledTrigger): void {
+  if (
+    trigger.filters?.intake_triage_state_id !== undefined &&
+    (trigger.on !== "linear.delegated_issue_updated" ||
+      !trigger.filters.team ||
+      !(trigger.filters.connection ?? trigger.filters.connectionId) ||
+      !trigger.filters.from_users?.length ||
+      trigger.filters.from_users.includes("*"))
+  ) {
+    throw new Error(
+      `trigger ${trigger.name} intake_triage_state_id requires linear.delegated_issue_updated, team, connection and explicit from_users`,
+    );
+  }
 }

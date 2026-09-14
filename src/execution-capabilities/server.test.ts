@@ -14,11 +14,21 @@ import { describe, it, vi } from "vitest";
 import { z } from "zod";
 import { hashAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
 import type { JsonValue } from "../config/compiler.js";
+import { AgentExecutionCompletionFailure } from "../daemons/lifecycle.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { createFetchServer } from "../http/node-server.js";
 import { registerResponseLifecycle, takeResponseLifecycle } from "../http/response-lifecycle.js";
-import { OutputExecutorRegistry, replyOutputTool, type OutputCapability } from "./outputs.js";
+import {
+  OutputExecutorRegistry,
+  replyOutputTool,
+  type OutputCapability,
+  type OutputExecutor,
+} from "./outputs.js";
+import {
+  OUTPUT_DELIVERY_FAILED_REASON,
+  failedRequiredOutputDeliveries,
+} from "./required-outputs.js";
 import { createExecutionCapabilityServer } from "./server.js";
 
 const RpcResponseSchema = z
@@ -166,6 +176,88 @@ describe("execution capability MCP boundary", () => {
       await client.close();
       await closeServer(endpoint.server);
     }
+  });
+
+  it("allows an event-native reply to be sent repeatedly without a synthetic cap", async () => {
+    const fixture = await capabilityFixture(undefined, "succeeded", null);
+
+    for (const content of ["Starting.", "Still working.", "Done."]) {
+      const response = await fixture.call("tools/call", {
+        name: "reply",
+        arguments: { content },
+      });
+      assert.equal(ToolResultSchema.parse(response.result).isError, undefined);
+    }
+
+    assert.equal(fixture.outbound.length, 3);
+    assert.deepEqual(
+      (await fixture.database.findAgentExecutionById(fixture.executionId))?.outputEmissions,
+      { "slack.reply": 3 },
+    );
+  });
+
+  it("refuses an output whose input changed before its attempt was reserved", async () => {
+    const fixture = await capabilityFixture();
+    const lock = fixture.database.withAdvisoryLock.bind(fixture.database);
+    let switched = false;
+    fixture.database.withAdvisoryLock = <T>(key: string, operation: () => Promise<T>) =>
+      lock(key, async () => {
+        if (!switched && key === `execution.prompt:${fixture.executionId}`) {
+          switched = true;
+          await fixture.database.beginAgentExecutionTurn(
+            fixture.executionId,
+            new Date(),
+            "new-input",
+            {
+              triggerContext: {},
+              outputContext: { ...slackOutputContext, threadTs: "new-thread" },
+            },
+          );
+        }
+        return operation();
+      });
+    const response = await fixture.call("tools/call", {
+      name: "reply",
+      arguments: { content: "Old answer" },
+    });
+    assert.equal(ToolResultSchema.parse(response.result).isError, true);
+    assert.equal(fixture.outbound.length, 0);
+    assert.equal(
+      Object.keys(
+        (await fixture.database.findAgentExecutionById(fixture.executionId))!
+          .outputDeliveryAttempts,
+      ).length,
+      0,
+    );
+    const current = await fixture.call("tools/call", {
+      name: "reply",
+      arguments: { content: "Latest answer" },
+    });
+    assert.equal(ToolResultSchema.parse(current.result).isError, undefined);
+    assert.deepEqual(fixture.outbound[0]?.outputContext, {
+      ...slackOutputContext,
+      threadTs: "new-thread",
+    });
+  });
+
+  it("does not acknowledge an output twice when its durable executor already recorded it", async () => {
+    let fixture: Awaited<ReturnType<typeof capabilityFixture>>;
+    fixture = await capabilityFixture(async (input) => {
+      assert.ok(input.attemptId);
+      await fixture.database.completeAgentExecutionOutput(
+        input.agentExecutionId,
+        input.attemptId,
+        new Date(),
+      );
+      return { deliveryAcknowledged: true };
+    });
+    const complete = vi.spyOn(fixture.database, "completeAgentExecutionOutput");
+    const response = await fixture.call("tools/call", {
+      name: "reply",
+      arguments: { content: "Delivered" },
+    });
+    assert.equal(ToolResultSchema.parse(response.result).isError, undefined);
+    assert.equal(complete.mock.calls.length, 1);
   });
 
   it("renders the structured execution MCP contract exposed by the server", async () => {
@@ -667,7 +759,7 @@ describe("execution capability MCP boundary", () => {
     const fixture = await capabilityFixture(
       async () => {
         attempts += 1;
-        if (attempts === 1) throw new Error("delivery timeout");
+        if (attempts === 1) throw new Error("delivery timeout:\n  upstream closed the connection");
       },
       "succeeded",
       1,
@@ -685,6 +777,15 @@ describe("execution capability MCP boundary", () => {
     });
 
     assert.equal(ToolResultSchema.parse(failed.result).isError, true);
+    const failedText = z
+      .object({ content: z.array(z.object({ type: z.literal("text"), text: z.string() })) })
+      .parse(failed.result).content[0]?.text;
+    assert.match(failedText ?? "", /Output delivery failed\./u);
+    assert.match(
+      failedText ?? "",
+      /Provider said: "delivery timeout: upstream closed the connection"\./u,
+    );
+    assert.match(failedText ?? "", /quote reference [0-9a-f-]{36}/u);
     assert.equal(ToolResultSchema.parse(retry.result).isError, undefined);
     assert.equal(
       (await fixture.database.findAgentExecutionById(fixture.executionId))?.outputEmissions[
@@ -699,6 +800,44 @@ describe("execution capability MCP boundary", () => {
     assert.equal(ToolResultSchema.parse(completed.result).isError, undefined);
     assert.equal(fixture.outbound.length, 2);
   });
+
+  it("ends the execution as failed when finish follows only failed required deliveries", async () => {
+    const fixture = await capabilityFixture(
+      () => Promise.reject(new Error("parent comment must be a top level comment")),
+      "succeeded",
+      1,
+      undefined,
+      false,
+      ["slack.reply"],
+    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const reply = await fixture.call("tools/call", {
+        name: "reply",
+        arguments: { content: "hello" },
+      });
+      assert.equal(ToolResultSchema.parse(reply.result).isError, true);
+    }
+
+    const finished = await fixture.call("tools/call", {
+      name: "finish_execution",
+      arguments: {},
+    });
+
+    assert.equal(ToolResultSchema.parse(finished.result).isError, true);
+    const text = z
+      .object({ content: z.array(z.object({ type: z.literal("text"), text: z.string() })) })
+      .parse(finished.result).content[0]?.text;
+    assert.match(text ?? "", /slack\.reply after 3 failed attempts/u);
+    assert.match(text ?? "", /recorded as failed/u);
+    assert.doesNotMatch(text ?? "", /retry `finish_execution`/u);
+    assert.deepEqual(fixture.completions, [{ executionId: fixture.executionId, token: "token" }]);
+    const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
+    assert.deepEqual(
+      { status: execution?.status, result: execution?.result },
+      { status: "failed", result: { status: "failed", reason: "output_delivery_failed" } },
+    );
+    assert.equal(fixture.outbound.length, 3);
+  });
 });
 
 const slackOutputContext = {
@@ -710,9 +849,9 @@ const slackOutputContext = {
 };
 
 async function capabilityFixture(
-  execute: (() => Promise<void>) | undefined = () => Promise.resolve(),
+  execute: OutputExecutor | undefined = () => Promise.resolve(),
   completionStatus: "succeeded" | "failed" = "succeeded",
-  maxReplies = 1,
+  maxReplies: number | null = 1,
   outputSchema?: JsonValue,
   autoArchive = false,
   requiredOutputTypes: readonly string[] = [],
@@ -741,7 +880,7 @@ async function capabilityFixture(
     tool: outputTool,
     execute: async (input) => {
       outbound.push(input);
-      await execute();
+      return execute(input);
     },
   });
   for (const capability of additionalCapabilities) outputs.register(capability);
@@ -755,6 +894,15 @@ async function capabilityFixture(
     outputs,
     async completeExecution(input) {
       completions.push(input);
+      const current = await database.findAgentExecutionById(input.executionId);
+      const undelivered = current === undefined ? [] : failedRequiredOutputDeliveries(current);
+      if (undelivered.length > 0) {
+        // What the lifecycle does: the run ends as failed and the finish is refused for it.
+        await database.transitionAgentExecution(input.executionId, "failed", {
+          result: { status: "failed", reason: OUTPUT_DELIVERY_FAILED_REASON },
+        });
+        throw new AgentExecutionCompletionFailure(OUTPUT_DELIVERY_FAILED_REASON);
+      }
       return (
         await database.transitionAgentExecution(
           input.executionId,
@@ -861,7 +1009,7 @@ async function abortHttpRequestAfterFirstResponseData(options: {
 }
 
 function launchIntent(
-  maxReplies = 1,
+  maxReplies: number | null = 1,
   outputSchema?: JsonValue,
   autoArchive = false,
   requiredOutputTypes: readonly string[] = [],
@@ -884,7 +1032,7 @@ function launchIntent(
     allowOutputs: [
       {
         type: "slack.reply",
-        max: maxReplies,
+        ...(maxReplies === null ? {} : { max: maxReplies }),
         ...(requiredOutputTypes.includes("slack.reply") ? { required: true } : {}),
       },
       ...requiredOutputTypes

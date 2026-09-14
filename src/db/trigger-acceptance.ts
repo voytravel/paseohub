@@ -1,10 +1,15 @@
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import {
+  hasRequiredLinearAgentSessionScopes,
+  linearConnectionRequiresReauthorization,
+} from "../providers/linear/client.js";
 import type { DrizzleHandle } from "./runtime/index.js";
 import * as schema from "./schema.js";
 import { ConnectionRepository } from "./connections.js";
 import type {
   AcceptDiscordEventInput,
   AcceptGitHubEventInput,
+  AcceptLinearEventInput,
   AcceptSlackEventInput,
   GitHubLifecycleReceiptClaim,
   GitHubLifecycleReceiptClaimInput,
@@ -28,23 +33,35 @@ export class ProviderEventAcceptanceRepository {
   ) {}
 
   acceptGitHub(input: AcceptGitHubEventInput): Promise<ProviderEventAcceptance> {
-    return this.acceptProvider("github", input.installationId, input.repositoryId, input);
+    return this.acceptProvider("github", input.installationId, [input.repositoryId], input);
   }
 
   acceptDiscord(input: AcceptDiscordEventInput): Promise<ProviderEventAcceptance> {
-    return this.acceptProvider("discord", input.guildId, input.guildId, input);
+    return this.acceptProvider("discord", input.guildId, [input.guildId], input);
   }
 
   acceptSlack(input: AcceptSlackEventInput): Promise<ProviderEventAcceptance> {
-    return this.acceptProvider("slack", input.teamId, input.teamId, input);
+    return this.acceptProvider("slack", input.teamId, [input.teamId], input);
+  }
+
+  acceptLinear(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance> {
+    return this.acceptProvider(
+      "linear",
+      input.linearOrganizationId,
+      [input.projectId, input.teamId],
+      input,
+    );
   }
 
   private async acceptProvider(
-    provider: "github" | "slack" | "discord",
+    provider: "github" | "slack" | "discord" | "linear",
     externalId: number | string,
-    resourceId: number | string | undefined,
+    candidateResourceIds: readonly (number | string | undefined)[],
     input: ProviderEventEvidence,
   ): Promise<ProviderEventAcceptance> {
+    const resourceIds = [
+      ...new Set(candidateResourceIds.flatMap((id) => (id === undefined ? [] : [String(id)]))),
+    ];
     return this.database.transaction(async (transaction) => {
       const connection = await findConnection(transaction, provider, externalId);
       if (connection === undefined) {
@@ -56,14 +73,16 @@ export class ProviderEventAcceptanceRepository {
 
       const dropReason =
         input.dropReason ??
-        (provider === "github" && "status" in connection && connection.status === "suspended"
+        ((provider === "github" && "status" in connection && connection.status === "suspended") ||
+        (provider === "linear" &&
+          linearConnectionUnavailable(connection, input.receivedAt, input.source))
           ? "configuration_unavailable"
           : undefined);
       const receipt = await claimProviderReceipt(transaction, {
         organizationId: connection.organizationId,
         provider,
         connectionId: connection.id,
-        resourceId: resourceId === undefined ? null : String(resourceId),
+        resourceId: resourceIds[0] ?? null,
         input: dropReason === undefined ? input : { ...input, dropReason },
       });
       if (!receipt.inserted) {
@@ -102,10 +121,9 @@ export class ProviderEventAcceptanceRepository {
             eq(schema.projectTriggerRoutes.connectionId, connection.id),
             or(
               isNull(schema.projectTriggerRoutes.resourceId),
-              eq(
-                schema.projectTriggerRoutes.resourceId,
-                resourceId === undefined ? "" : String(resourceId),
-              ),
+              ...(resourceIds.length === 0
+                ? []
+                : [inArray(schema.projectTriggerRoutes.resourceId, resourceIds)]),
             ),
           ),
         );
@@ -297,6 +315,42 @@ export class ProviderEventAcceptanceRepository {
   }
 }
 
+function linearConnectionUnavailable(
+  connection: object,
+  receivedAt: Date,
+  source: string,
+): boolean {
+  if (!("scopes" in connection) || !isStringArray(connection.scopes)) return true;
+  if (
+    !("refreshToken" in connection) ||
+    (connection.refreshToken !== null && typeof connection.refreshToken !== "string")
+  ) {
+    return true;
+  }
+  if (
+    !("accessTokenExpiresAt" in connection) ||
+    (connection.accessTokenExpiresAt !== null && !(connection.accessTokenExpiresAt instanceof Date))
+  ) {
+    return true;
+  }
+  return (
+    (source === "linear.agent_session" &&
+      !hasRequiredLinearAgentSessionScopes(connection.scopes)) ||
+    linearConnectionRequiresReauthorization(
+      {
+        scopes: connection.scopes,
+        refreshToken: connection.refreshToken,
+        accessTokenExpiresAt: connection.accessTokenExpiresAt,
+      },
+      receivedAt,
+    )
+  );
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 function eventFromReceipt(
   receipt: typeof schema.providerEventReceipts.$inferSelect,
   route: ProviderEventRouteSnapshot,
@@ -401,7 +455,7 @@ function selectFirstRoutePerProject<Route extends { projectId: string }>(
 
 async function findConnection(
   transaction: HubTransaction,
-  provider: "github" | "slack" | "discord",
+  provider: "github" | "slack" | "discord" | "linear",
   externalId: number | string,
 ) {
   if (provider === "github") {
@@ -427,6 +481,20 @@ async function findConnection(
       .limit(1);
     return row;
   }
+  if (provider === "linear") {
+    const [row] = await transaction
+      .select({
+        id: schema.linearConnections.id,
+        organizationId: schema.linearConnections.organizationId,
+        scopes: schema.linearConnections.scopes,
+        refreshToken: schema.linearConnections.refreshToken,
+        accessTokenExpiresAt: schema.linearConnections.accessTokenExpiresAt,
+      })
+      .from(schema.linearConnections)
+      .where(eq(schema.linearConnections.linearOrganizationId, String(externalId)))
+      .limit(1);
+    return row;
+  }
   const [row] = await transaction
     .select({
       id: schema.discordConnections.id,
@@ -442,7 +510,7 @@ async function claimProviderReceipt(
   transaction: HubTransaction,
   input: {
     organizationId: string;
-    provider: "github" | "slack" | "discord" | "manual";
+    provider: "github" | "slack" | "discord" | "linear" | "manual";
     connectionId: string | null;
     resourceId: string | null;
     input: ProviderEventEvidence;

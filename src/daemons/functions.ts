@@ -13,6 +13,7 @@ const daemonSchema = z.object({
   connectedAt: z.string().datetime().nullable(),
   lastSeenAt: z.string().datetime(),
   registeredAt: z.string().datetime(),
+  permissions: z.array(z.string()),
 });
 const daemonListSchema = z.object({
   daemons: z.array(daemonSchema),
@@ -25,6 +26,7 @@ const scopedRenameSchema = organizationScopeSchema.extend(renameSchema.shape);
 const scopedDaemonIdSchema = organizationScopeSchema.extend(daemonIdSchema.shape);
 
 export type BrowserDaemon = z.infer<typeof daemonSchema>;
+export type BrowserDaemonList = z.infer<typeof daemonListSchema>;
 export interface DaemonCommand {
   state: "complete" | "sessionExpired" | "organizationRequired";
 }
