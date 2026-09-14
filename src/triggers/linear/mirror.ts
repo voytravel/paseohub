@@ -122,6 +122,13 @@ export function createLinearMirrorState(): LinearMirrorState {
   };
 }
 
+/** Discard coalesced text once the authoritative final report owns this turn. */
+export function closeLinearMirror(state: LinearMirrorState): void {
+  state.turnClosed = true;
+  state.pendingMessageId = null;
+  state.pendingText = "";
+}
+
 /**
  * Turns one stream event into the activities to post, mutating `state`.
  *
@@ -132,7 +139,7 @@ export function planLinearMirrorActivities(
   event: HubExecutionAgentStreamEvent,
   state: LinearMirrorState,
 ): LinearAgentActivityContent[] {
-  if (state.exhausted) return [];
+  if (state.exhausted || state.turnClosed) return [];
   const planned: LinearAgentActivityContent[] = [];
 
   // A turn boundary flushes whatever text was being accumulated: nothing more will extend it.
@@ -214,7 +221,7 @@ function planToolCall(
     (tool) => name === `hub.${tool}` || name.endsWith(`hub__${tool}`),
   );
   if (closesTurn || nativeOutput) {
-    if (closesTurn) state.turnClosed = true;
+    if (closesTurn) closeLinearMirror(state);
     return;
   }
   // Text before the action: the agent usually narrates, then acts.
@@ -238,7 +245,7 @@ function extendStreamedText(accumulated: string, incoming: string): string {
 
 /** Flushes the buffered assistant text as a `thought`, if there is anything worth posting. */
 export function flushLinearMirror(state: LinearMirrorState): LinearAgentActivityContent[] {
-  if (state.exhausted) return [];
+  if (state.exhausted || state.turnClosed) return [];
   const planned: LinearAgentActivityContent[] = [];
   pushFlush(planned, state);
   return capped(planned, state);

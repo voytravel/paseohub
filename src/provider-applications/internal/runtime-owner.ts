@@ -532,10 +532,11 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
               reactionState,
             ) ?? Promise.resolve(),
         ),
-      onAgentStreamEvent: (triggerContext, outputContext, event) =>
+      onAgentStreamEvent: (triggerContext, outputContext, event, executionId) =>
         invoke(
           (trigger) =>
-            trigger.onAgentStreamEvent?.(triggerContext, outputContext, event) ?? Promise.resolve(),
+            trigger.onAgentStreamEvent?.(triggerContext, outputContext, event, executionId) ??
+            Promise.resolve(),
         ),
       onAgentExecutionTerminal: (executionId, triggerContext) =>
         invoke(

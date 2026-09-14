@@ -218,6 +218,8 @@ export interface TriggerProvider<
     triggerContext: TriggerContext,
     outputContext: OutputContext,
     event: HubExecutionAgentStreamEvent,
+    /** Durable execution identity for providers that coordinate mirrors with output delivery. */
+    executionId?: string,
   ): Promise<void>;
   onAgentExecutionTerminal?(executionId: string, triggerContext: TriggerContext): Promise<void>;
   onMachineTerminated?(

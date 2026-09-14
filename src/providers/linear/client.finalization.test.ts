@@ -45,6 +45,7 @@ it("reads state type and updatedAt from the issue for finalization and intake gu
         issue: {
           id: "issue",
           title: "Work",
+          assignee: null,
           state: { id: "done", type: "completed" },
           updatedAt: "2026-09-11T12:00:00Z",
           labels: { nodes: [] },
@@ -55,8 +56,10 @@ it("reads state type and updatedAt from the issue for finalization and intake gu
   const issue = await api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue" });
   assert.equal(issue?.stateType, "completed");
   assert.equal(issue?.updatedAt, "2026-09-11T12:00:00Z");
+  assert.equal(issue?.assigneeId, null);
   assert.match(requests[0]?.query ?? "", /state \{ id type \}/u);
   assert.match(requests[0]?.query ?? "", /updatedAt/u);
+  assert.match(requests[0]?.query ?? "", /assignee \{ id \}/u);
 });
 
 it("reads every page of team states and human/app membership", async () => {

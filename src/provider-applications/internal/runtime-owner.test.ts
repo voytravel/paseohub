@@ -83,12 +83,20 @@ describe("dynamic provider runtime", () => {
     const started: string[] = [];
     const stopped: string[] = [];
     const completed: string[] = [];
+    const mirrored: unknown[][] = [];
     const runtime = new DynamicProviderRuntime({
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
       registrationFactory: ({ configuration }) =>
-        fakeRegistration(configurationId(configuration), started, stopped, completed),
+        fakeRegistration(
+          configurationId(configuration),
+          started,
+          stopped,
+          completed,
+          false,
+          mirrored,
+        ),
     });
     const stable = runtime
       .registrations()
@@ -133,6 +141,17 @@ describe("dynamic provider runtime", () => {
     assert.deepEqual(stopped, ["A1"]);
     assert.equal(trigger.workKeyFor?.(oldMatch!.triggerContext), "issue:A2");
     assert.equal(trigger.workspaceKeyFor?.(oldMatch!.triggerContext), "workspace:A2");
+
+    const streamEvent = { type: "turn_completed", provider: "codex" } as const;
+    await trigger.onAgentStreamEvent?.(
+      oldMatch!.triggerContext,
+      oldMatch!.outputContext,
+      streamEvent,
+      "execution-1",
+    );
+    assert.deepEqual(mirrored, [
+      ["A2", oldMatch!.triggerContext, oldMatch!.outputContext, streamEvent, "execution-1"],
+    ]);
 
     await trigger.onAgentExecutionCompleted?.(oldMatch!.triggerContext, oldMatch!.outputContext, {
       status: "succeeded",
@@ -805,12 +824,16 @@ function fakeRegistration(
   stopped: string[],
   completed: string[],
   failStart = false,
+  mirrored: unknown[][] = [],
 ): ProviderRegistration {
   const trigger: TriggerProvider<"slack", { id: string }, { id: string }> = {
     name: "slack",
     eventNames: ["slack.mention"],
     workKeyFor: () => `issue:${id}`,
     workspaceKeyFor: () => `workspace:${id}`,
+    onAgentStreamEvent: async (...args) => {
+      mirrored.push([id, ...args]);
+    },
     match: () =>
       Promise.resolve([
         {

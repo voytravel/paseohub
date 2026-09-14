@@ -52,10 +52,12 @@ import type { LinearIssueSessionBridgeStore } from "../../db/linear-issue-sessio
 import { isIssueSessionBridgeEcho, sessionForIssueEvent } from "./issue-session-bridge.js";
 import { continueLinearIssue } from "./issue-continuation.js";
 import {
+  closeLinearMirror,
   createLinearMirrorState,
   planLinearMirrorActivities,
   type LinearMirrorState,
 } from "./mirror.js";
+import { deliverLinearMirrorBatch, type LinearMirrorStore } from "./mirror-delivery.js";
 
 export interface LinearOutputContext {
   provider: "linear";
@@ -205,6 +207,7 @@ export interface LinearTriggerProviderOptions {
   > &
     Partial<LinearIssueSessionBridgeStore> &
     Partial<LinearTriageIntakeStore> &
+    Partial<LinearMirrorStore> &
     Partial<
       Pick<
         Database,
@@ -227,7 +230,10 @@ export function createLinearTriggerProvider(
    * posted twice, or out of order, is defined by the thread the user reads. Each turn resets its
    * budget in `onDispatchAccepted`, and `onAgentExecutionTerminal` drops the entry.
    */
-  const mirrors = new Map<string, LinearMirrorState>();
+  const mirrors = new Map<string, { state: LinearMirrorState; turnKey: string | undefined }>();
+  const resetMirror = (id: string, turnKey = mirrors.get(id)?.turnKey) => {
+    mirrors.set(id, { state: createLinearMirrorState(), turnKey });
+  };
   /**
    * One in-flight post per session, chained.
    *
@@ -237,34 +243,53 @@ export function createLinearTriggerProvider(
   const mirrorQueues = new Map<string, Promise<void>>();
 
   const mirrorActivities = (
-    linearOrganizationId: string,
-    agentSessionId: string,
+    triggerContext: LinearTriggerContext,
+    outputContext: LinearOutputContext,
     event: Parameters<NonNullable<TriggerProvider["onAgentStreamEvent"]>>[2],
+    executionId?: string,
   ): Promise<void> => {
+    const { linearOrganizationId, agentSessionId } = outputContext;
+    if (agentSessionId === null) return Promise.resolve();
     const client = options.client;
     if (client === undefined) return Promise.resolve();
-    const state = mirrors.get(agentSessionId);
-    if (state === undefined) return Promise.resolve();
+    let mirror = mirrors.get(agentSessionId);
+    if (mirror === undefined) {
+      mirror = { state: createLinearMirrorState(), turnKey: triggerContext.target.turnKey };
+      mirrors.set(agentSessionId, mirror);
+    }
+    if (mirror.turnKey !== triggerContext.target.turnKey) return Promise.resolve();
+    const { state } = mirror;
     const planned = planLinearMirrorActivities(event, state);
     if (planned.length === 0) return Promise.resolve();
     const queued = (mirrorQueues.get(agentSessionId) ?? Promise.resolve())
       .then(async () => {
-        for (const content of planned) {
-          await client.createAgentActivity({
-            linearOrganizationId,
-            agentSessionId,
-            content,
-            // What the agent SAYS is the transcript and stays; what it RUNS is a live state and
-            // does not. Linear replaces an ephemeral activity with the next one, so the panel
-            // keeps every `thought` and shows a single current step instead of a command log.
-            //
-            // Measured on POS-38 before this split: 50 activities in one session, about forty of
-            // them "Ran a command …". The issue page collapses a session to its LAST activity, so
-            // the agent's answer was the 41st line of a log nobody expands — reported as "you
-            // still have not replied" while the `response` was there all along.
-            ephemeral: content.type === "action",
-          });
-        }
+        const delivered = await deliverLinearMirrorBatch({
+          ...(options.database === undefined ? {} : { database: options.database }),
+          ...(executionId === undefined ? {} : { executionId }),
+          triggerContext,
+          outputContext,
+          isCurrent: () => mirrors.get(agentSessionId) === mirror,
+          publish: async (expectedConnectionId) => {
+            for (const content of planned) {
+              await client.createAgentActivity({
+                linearOrganizationId,
+                agentSessionId,
+                ...(expectedConnectionId === undefined ? {} : { expectedConnectionId }),
+                content,
+                // What the agent SAYS is the transcript and stays; what it RUNS is a live state and
+                // does not. Linear replaces an ephemeral activity with the next one, so the panel
+                // keeps every `thought` and shows a single current step instead of a command log.
+                //
+                // Measured on POS-38 before this split: 50 activities in one session, about forty of
+                // them "Ran a command …". The issue page collapses a session to its LAST activity, so
+                // the agent's answer was the 41st line of a log nobody expands — reported as "you
+                // still have not replied" while the `response` was there all along.
+                ephemeral: content.type === "action",
+              });
+            }
+          },
+        });
+        if (!delivered) closeLinearMirror(state);
         return undefined;
       })
       .catch((error: unknown) => {
@@ -351,8 +376,13 @@ export function createLinearTriggerProvider(
       });
       if (matches.length === 0) return "trigger_filters_rejected";
       if (
-        await continueAcceptedIssueMatch(options, externalTrigger, event, stored, matches, (id) =>
-          mirrors.set(id, createLinearMirrorState()),
+        await continueAcceptedIssueMatch(
+          options,
+          externalTrigger,
+          event,
+          stored,
+          matches,
+          resetMirror,
         )
       )
         return "steered_into_live_session";
@@ -372,7 +402,7 @@ export function createLinearTriggerProvider(
       // clears — `from_users`, team, connection. The `stop` path above skips them; this one must
       // not, and the difference is on purpose.
       const steered = await steerLiveLinearSession(
-        { ...options, resetMirror: (id) => mirrors.set(id, createLinearMirrorState()) },
+        { ...options, resetMirror },
         externalTrigger,
         event,
       );
@@ -400,7 +430,7 @@ export function createLinearTriggerProvider(
         prompt: `${input.prompt}\n\n<linear-event>\n${JSON.stringify(triggerContext.event.linear)}\n</linear-event>`,
       });
       if (continued && input.outputContext.agentSessionId !== null)
-        mirrors.set(input.outputContext.agentSessionId, createLinearMirrorState());
+        resetMirror(input.outputContext.agentSessionId, input.outputContext.turnKey);
       return continued;
     },
     async materializeContext(launch): Promise<LinearMaterializedContext> {
@@ -514,7 +544,7 @@ export function createLinearTriggerProvider(
       if (linearAgentReactionPhase(reactionState) !== undefined) return reactionState;
       // A fresh budget per turn: the ceiling protects one turn from flooding the issue, it is not
       // a lifetime quota on the conversation.
-      mirrors.set(agentSession.id, createLinearMirrorState());
+      resetMirror(agentSession.id, triggerContext.target.turnKey);
       await options.client.createAgentActivity({
         linearOrganizationId: triggerContext.event.linear.organization.id,
         agentSessionId: agentSession.id,
@@ -561,10 +591,10 @@ export function createLinearTriggerProvider(
      * Only sessions have a panel to mirror into: a comment-triggered run answers with a single
      * comment, and posting its every step would turn one reply into fifty.
      */
-    async onAgentStreamEvent(triggerContext, _outputContext, event) {
+    async onAgentStreamEvent(triggerContext, outputContext, event, executionId) {
       const agentSession = triggerContext.event.linear.agent_session;
       if (agentSession === null) return;
-      await mirrorActivities(triggerContext.event.linear.organization.id, agentSession.id, event);
+      await mirrorActivities(triggerContext, outputContext, event, executionId);
     },
     async onAgentExecutionTerminal(executionId, triggerContext) {
       if (triggerContext.target.publishIssueComment === true) {
@@ -639,7 +669,7 @@ async function continueAcceptedIssueMatch(
   event: NormalizedLinearEvent,
   stored: StoredProjectConfiguration,
   matches: TriggerProviderMatch<LinearTriggerContext, LinearOutputContext>[],
-  resetMirror: (id: string) => void,
+  resetMirror: (id: string, turnKey?: string) => void,
 ): Promise<boolean> {
   if (options.executions === undefined || matches.length !== 1) return false;
   const match = matches[0]!;
@@ -656,7 +686,7 @@ async function continueAcceptedIssueMatch(
     prompt: `${promptForEvent(event)}\n\n<linear-event>\n${JSON.stringify(match.triggerContext.event.linear)}\n</linear-event>`,
   });
   if (continued && match.outputContext.agentSessionId !== null)
-    resetMirror(match.outputContext.agentSessionId);
+    resetMirror(match.outputContext.agentSessionId, match.outputContext.turnKey);
   return continued;
 }
 

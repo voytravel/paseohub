@@ -30,6 +30,27 @@ const EXECUTION_ID = "00000000-0000-4000-8000-000000000001";
 const ACKNOWLEDGED_AT = new Date("2026-01-01T00:00:01.000Z");
 
 describe("durable Hub action acknowledgement state", () => {
+  it("passes the durable execution identity to provider stream mirrors", async () => {
+    const mirrored: unknown[][] = [];
+    const provider: TriggerProvider = {
+      name: "test",
+      eventNames: ["manual.test"],
+      match: async () => [],
+      onAgentStreamEvent: async (...args) => {
+        mirrored.push(args);
+      },
+    };
+    const fixture = await acknowledgementFixture([provider]);
+    try {
+      await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
+      await fixture.connection.emit(toolCall("wrapped", "functions.exec", "completed"));
+      assert.equal(mirrored.length, 1);
+      assert.equal(mirrored[0]![3], EXECUTION_ID);
+      assert.deepEqual(mirrored[0]![0], { provider: "test" });
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
   it("keeps the classified dispatch code in redacted error logs", () => {
     const diagnostic = serializeError(
       new DaemonDispatchFailure("github_authority_unavailable", {
@@ -785,7 +806,7 @@ function agentSessionIdOf(outputContext: unknown): unknown {
     : undefined;
 }
 
-async function acknowledgementFixture() {
+async function acknowledgementFixture(providers: TriggerProvider[] = []) {
   const database = createMemoryDatabase({ now: () => new Date("2026-01-01T00:00:00.000Z") });
   await database.insertAgentExecution({
     id: EXECUTION_ID,
@@ -793,7 +814,7 @@ async function acknowledgementFixture() {
     projectId: "project-ack-test",
     machineId: null,
     daemonId: DAEMON_ID,
-    triggerContext: {},
+    triggerContext: { provider: "test" },
     outputContext: {},
     configurationRevisionId: "revision-ack-test",
   });
@@ -806,7 +827,7 @@ async function acknowledgementFixture() {
   return {
     database,
     connection,
-    lifecycle: createLifecycle(database, connection),
+    lifecycle: createLifecycle(database, connection, providers),
   };
 }
 
@@ -947,9 +968,11 @@ class DispatchConnection implements DaemonConnection {
 function createLifecycle(
   database: Awaited<ReturnType<typeof createMemoryDatabase>>,
   connection: AcknowledgementConnection,
+  providers: TriggerProvider[] = [],
 ): DaemonDispatchLifecycle {
   return createDaemonDispatchLifecycle({
     database,
+    providers,
     connectionForDaemon: (daemonId) => (daemonId === DAEMON_ID ? connection : undefined),
   });
 }

@@ -2219,6 +2219,7 @@ export class DaemonDispatchLifecycle {
         target.triggerContext,
         target.outputContext,
         event,
+        executionId,
       );
     } catch (error: unknown) {
       this.report(error, "daemon.provider.stream-mirror", { executionId });
