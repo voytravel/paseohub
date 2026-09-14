@@ -230,7 +230,12 @@ export function createLinearReplyReporter(options: {
         throw new Error("Durable Linear reports require exact-ID publication lookup support");
       }
       if (claimed.commentConfirmedAt === null) {
-        await reconcileComment(claimed.payload);
+        const isFailureNotice =
+          claimed.payload.outcome?.kind === "blocked" ||
+          claimed.payload.outcome?.kind === "interrupted";
+        if (!isFailureNotice || claimed.payload.agentSessionId === null) {
+          await reconcileComment(claimed.payload);
+        }
         await database.confirmLinearReplyDestination(claimed.id, "comment", now());
       }
       if (claimed.payload.agentSessionId !== null && claimed.activityConfirmedAt === null) {

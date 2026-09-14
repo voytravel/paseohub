@@ -1528,8 +1528,10 @@ async function sessionForDelegatedComment(
 
 type NativeBridgeClient = Pick<
   LinearApiClient,
-  "readIssue" | "readCommentThread" | "createAgentSessionOnComment"
->;
+  "readIssue" | "readCommentThread"
+> & {
+  createAgentSessionOnIssue: NonNullable<LinearApiClient["createAgentSessionOnIssue"]>;
+};
 type NativeBridgeDatabase = Pick<
   Database,
   | "claimLinearCommentBridge"
@@ -1541,7 +1543,7 @@ type NativeBridgeDatabase = Pick<
 function requireNativeBridgeClient(
   client: LinearTriggerProviderOptions["client"],
 ): asserts client is NonNullable<LinearTriggerProviderOptions["client"]> & NativeBridgeClient {
-  if (client?.createAgentSessionOnComment === undefined || client.readIssue === undefined) {
+  if (client?.createAgentSessionOnIssue === undefined || client.readIssue === undefined) {
     throw new Error(
       "Linear delegated comments require native session support and a current issue read",
     );
@@ -1603,9 +1605,10 @@ async function createReservedLinearSession(input: {
   try {
     return await bind(
       (
-        await client.createAgentSessionOnComment({
+        await client.createAgentSessionOnIssue({
           linearOrganizationId: event.organizationId,
-          commentId: key.rootCommentId,
+          issueId: event.comment.issueId,
+          externalUrls: [],
         })
       ).id,
     );

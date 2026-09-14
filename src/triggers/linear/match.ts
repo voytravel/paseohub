@@ -225,6 +225,13 @@ function matchesDelegatedComment(
     (event.comment.parentId !== null && event.threadIsAgentSession !== false)
   )
     return false;
+  // If the comment explicitly targets another user or agent (e.g. @jarvis) and does not mention this app, do not intercept
+  const body = event.comment.body.toLowerCase();
+  const mentionsThisApp = body.includes("@pagent") || body.includes("@p agent") || body.includes(appUserId.toLowerCase());
+  if (!mentionsThisApp) {
+    const hasOtherMention = /@[a-z0-9_-]+/i.test(event.comment.body) || /\[@[^\]]+\]\([^)]+\)/i.test(event.comment.body) || /<user id="[^"]+"/i.test(event.comment.body);
+    if (hasOtherMention) return false;
+  }
   return true;
 }
 
